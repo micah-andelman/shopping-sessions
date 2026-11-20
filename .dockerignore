@@ -1,0 +1,8 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+kit/
+dev-answer/
+data/

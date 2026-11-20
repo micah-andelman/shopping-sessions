@@ -1,0 +1,6 @@
+dev/
+out/
+data/
+kit/generator/target/
+__pycache__/
+.venv/
