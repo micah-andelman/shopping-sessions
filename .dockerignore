@@ -1,8 +1,14 @@
 fixtures/
 dev/
 out/
-*.md
-.git
+out-*/
+target/
 kit/
 dev-answer/
-data/
+ref/
+tools/
+scripts/
+pipeline/
+.venv/
+.git
+*.md

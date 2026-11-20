@@ -1,0 +1,20 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+memchr = "2.7"
+foldhash = "0.1"
+arrow-array = "54.2"
+arrow-schema = "54.2"
+parquet = { version = "54.2", default-features = false, features = ["arrow"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
