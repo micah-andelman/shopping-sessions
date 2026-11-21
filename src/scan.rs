@@ -144,6 +144,21 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut emit: impl FnMut(&[Option<&'
 /// Input bytes per batch (multiple of 64). Position buffers for one batch stay in L1/L2.
 pub const BATCH: usize = 8 * 1024;
 
+/// Software prefetch distance in bytes ahead of stage 1 (0 = off). Page-cache pages are not
+/// physically contiguous, so the hardware stream prefetchers restart at every 4 KB boundary.
+pub static PREFETCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4096);
+
+/// A hint only: never faults, whatever the address.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stats {
     /// Lines seen (including empty and dropped ones).
@@ -239,6 +254,7 @@ pub fn scan2_batched<'a, const N: usize>(data: &'a [u8], batch: usize, mut emit:
     let mut dl: Vec<u32> = vec![0; cap];
     let mut nl: Vec<u32> = vec![0; cap];
     let mut bad: Vec<u32> = vec![0; cap];
+    let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
     let mut base = 0usize; // always the first byte of a line
     while base < len {
         let end = (base + batch).min(len);
@@ -249,6 +265,9 @@ pub fn scan2_batched<'a, const N: usize>(data: &'a [u8], batch: usize, mut emit:
         let mut cd = 0b10u64; // bit 1: previous byte is a delimiter (line start), bit 0: the one before
         let mut o = base;
         while o < end {
+            if pf != 0 {
+                prefetch(dp.wrapping_add(o + pf));
+            }
             let (d, l, q) = if o + 64 <= len {
                 masks3(&data[o..o + 64])
             } else {
@@ -349,6 +368,54 @@ pub fn scan2_batched<'a, const N: usize>(data: &'a [u8], batch: usize, mut emit:
         }
     }
     st
+}
+
+/// Benchmark helper: parts of stage 1 alone. mode 0 = masks only, 1 = masks + flatten + bad list.
+/// Returns [checksum, blocks, blocks with a quote, blocks with more than 8 delimiters].
+pub fn scan2_diag(data: &[u8], mode: u32) -> [u64; 4] {
+    let batch = BATCH;
+    let cap = batch + 64 + 16;
+    let mut dl: Vec<u32> = vec![0; cap];
+    let mut nl: Vec<u32> = vec![0; cap];
+    let mut bad: Vec<u32> = vec![0; cap];
+    let mut r = [0u64; 4];
+    let mut base = 0usize;
+    while base + batch <= data.len() {
+        let (mut nd, mut nn, mut nb) = (0usize, 0usize, 0usize);
+        let (mut cq, mut cd) = (0u64, 0b10u64);
+        let mut o = base;
+        while o < base + batch {
+            let (d, l, q) = masks3(&data[o..o + 64]);
+            if mode == 0 {
+                r[0] = r[0].wrapping_add(d ^ l ^ q);
+            } else {
+                let off = (o - base) as u32;
+                let pq = q << 1 | cq;
+                let p2d = d << 2 | cd;
+                let mut b = pq & !(p2d ^ d);
+                cq = q >> 63;
+                cd = d >> 62;
+                unsafe {
+                    flatten::<8>(dl.as_mut_ptr(), &mut nd, d, off);
+                    flatten::<2>(nl.as_mut_ptr(), &mut nn, l, off);
+                }
+                while b != 0 {
+                    bad[nb] = off + b.trailing_zeros();
+                    nb += 1;
+                    b &= b - 1;
+                }
+                if mode == 2 {
+                    r[1] += 1;
+                    r[2] += (q != 0) as u64;
+                    r[3] += (d.count_ones() > 8) as u64;
+                }
+            }
+            o += 64;
+        }
+        r[0] = r[0].wrapping_add((nd + nn + nb) as u64 + dl[nd / 2] as u64 + nl[nn / 2] as u64);
+        base += batch;
+    }
+    r
 }
 
 #[cfg(test)]

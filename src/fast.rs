@@ -385,6 +385,9 @@ impl LinkTab {
 pub fn run(data: &Path, out: &Path) -> bool {
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("SS_VERBOSE").is_ok();
+    if let Some(v) = std::env::var("SS_PF").ok().and_then(|v| v.parse().ok()) {
+        super::scan::PREFETCH.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
     let lap = |what: &str| {
         if verbose {
             // cumulative process user/sys CPU seconds and minor faults at each lap
@@ -590,6 +593,15 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 eprintln!("scanbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
             }
             eprintln!("scanbench bytes {} lines {} slow {}", bytes, lines.load(Relaxed), slow.load(Relaxed));
+            for mode in [0u32, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2] {
+                let acc: [AtomicU64; 4] = Default::default();
+                let t = std::time::Instant::now();
+                ev_chunks.par_iter().for_each(|&(mi, s, e)| {
+                    let r = super::scan::scan2_diag(&ev_maps[mi][s..e], mode);
+                    for i in 0..4 { acc[i].fetch_add(r[i], Relaxed); }
+                });
+                eprintln!("diag mode {} {:.4}s {:?}", mode, t.elapsed().as_secs_f64(), acc.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>());
+            }
             // The full event row body (as in the event job below, minus the bucket push) with each scanner.
             for r in 0..rounds * 2 {
                 let new = r % 2 == 1;
