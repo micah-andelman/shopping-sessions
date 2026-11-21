@@ -8,6 +8,7 @@
 //! Returns false (before writing anything) whenever an assumption does not hold.
 
 use super::*;
+mod e2;
 use std::collections::HashMap;
 use super::scan::{scan, scan2, scan3, scan3a, Line};
 
@@ -830,6 +831,11 @@ fn build_link_table(parts: &[(Vec<(u64, u64)>, Fb)], fbm: &HashMap<u64, &'static
 }
 
 pub fn run(data: &Path, out: &Path) -> bool {
+    // Engine 2 first (SS_E2=0 skips it): it exits on success, and returns false having written
+    // nothing when the data does not fit its layout.
+    if std::env::var("SS_E2").as_deref() != Ok("0") && e2::run(data, out) {
+        return true;
+    }
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     if let Some(v) = std::env::var("SS_PF").ok().and_then(|v| v.parse().ok()) {
