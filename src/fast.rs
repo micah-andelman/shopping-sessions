@@ -493,6 +493,84 @@ pub fn run(data: &Path, out: &Path) -> bool {
         eprintln!("{}", sink.load(Relaxed));
         std::process::exit(0);
     }
+    // SS_ROWBENCH=1 (diagnostic): cumulative cost of the event row body over the real groups
+    // with the real scanner, plus CPU time and page faults per stage.
+    if std::env::var("SS_ROWBENCH").is_ok() {
+        if std::env::var("SS_NOTHP").is_ok() { unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0); } }
+        let only: Option<Vec<usize>> = std::env::var("SS_RB_STAGES").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let ru = || unsafe {
+            let mut r: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut r);
+            (
+                r.ru_utime.tv_sec as f64 + r.ru_utime.tv_usec as f64 * 1e-6,
+                r.ru_stime.tv_sec as f64 + r.ru_stime.tv_usec as f64 * 1e-6,
+                r.ru_minflt as i64,
+            )
+        };
+        let names = ["touch", "scan", "+2 ts", "+ekey", "+type/valid/price/cat/ukey", "+push (full)", "+push (full)"];
+        for rep in 0..2 {
+            for stage in 0..7usize {
+                if let Some(o) = &only { if !o.contains(&stage) { continue; } }
+                let sink = AtomicU64::new(0);
+                let rows = AtomicU64::new(0);
+                let (u0, s0, f0) = ru();
+                let t = std::time::Instant::now();
+                ev_groups.par_iter().for_each(|grp| {
+                    let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
+                    let cap = bytes / 64 / NB + 64;
+                    let mut bk: Vec<Vec<Ev>> = if stage >= 5 { (0..NB).map(|_| Vec::with_capacity(cap)).collect() } else { Vec::new() };
+                    let mut fb = Fb::new();
+                    let (mut acc, mut n) = (0u64, 0u64);
+                    for &(mi, s, e) in grp.iter() {
+                        let d: &'static [u8] = &ev_maps[mi][s..e];
+                        if stage == 0 {
+                            let mut i = 0;
+                            while i < d.len() { acc += d[i] as u64; i += 4096; }
+                            continue;
+                        }
+                        scan::<7>(d, |f| {
+                            n += 1;
+                            let eid = match f[0] { Some(x) => x, None => return };
+                            if stage == 1 { acc += eid.len() as u64; return; }
+                            let ing = parse_ts_fast(f[3]);
+                            let ing = if ing == BAD { i64::MAX } else { ing };
+                            let ts = parse_ts_fast(f[2]);
+                            if stage == 2 { acc = acc.wrapping_add(ing as u64 ^ ts as u64); return; }
+                            let ekey = key_of(eid, &mut fb);
+                            if stage == 3 { acc = acc.wrapping_add(ing as u64 ^ ts as u64 ^ ekey); return; }
+                            let typ = match f[4] { Some(b"view") => 0u8, Some(b"cart") => 1, Some(b"purchase") => 2, _ => 3 };
+                            let mut ok = typ != 3 && f[1].is_some() && f[5].is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
+                            let mut price = 0u64;
+                            if ok && typ == 2 {
+                                let p = parse_price_fast(f[6]);
+                                if p < 0 { ok = false } else { price = p as u64 }
+                            }
+                            let (ukey, lo) = if ok {
+                                let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
+                                (key_of(f[1].unwrap(), &mut fb), ((ts - ws) as u64) << 33 | price << 9 | cat)
+                            } else {
+                                (0, NONE)
+                            };
+                            if stage == 4 { acc = acc.wrapping_add(ing as u64 ^ ekey ^ ukey ^ lo); return; }
+                            bk[bucket(ekey)].push(Ev { ekey, ukey, ing, lo });
+                        });
+                    }
+                    if stage == 6 { std::mem::forget(bk); }
+                    sink.fetch_add(acc, Relaxed);
+                    rows.fetch_add(n, Relaxed);
+                });
+                let w = t.elapsed().as_secs_f64();
+                let (u1, s1, f1) = ru();
+                let n = rows.load(Relaxed).max(1) as f64;
+                eprintln!(
+                    "rep {} stage {} {:<28} wall {:.3}s  user {:.3}s sys {:.3}s  minflt {:>7}  cpu-ns/row {:>6.1}  wall*thr-ns/row {:>6.1}  [{}]",
+                    rep, stage, names[stage], w, u1 - u0, s1 - s0, f1 - f0, (u1 - u0 + s1 - s0) * 1e9 / n, w * nthreads as f64 * 1e9 / n, sink.load(Relaxed) & 0xffff
+                );
+            }
+        }
+        std::process::exit(0);
+    }
     // Cold-cache I/O overlap: background threads ask the kernel for every input window
     // (links, then events interleaved across parse groups, then clicks) so reads run ahead of parsing.
     if std::env::var("SS_NOPREFETCH").is_err() {
