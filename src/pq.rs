@@ -82,15 +82,14 @@ impl T {
         self.varint(((v << 1) ^ (v >> 63)) as u64);
     }
     fn field(&mut self, id: i16, ty: u8) {
-        let last = self.last.last_mut().unwrap();
-        let d = id - *last;
+        let d = id - *self.last.last().unwrap();
         if d > 0 && d <= 15 {
             self.b.push(((d as u8) << 4) | ty);
         } else {
             self.b.push(ty);
             self.zz(id as i64);
         }
-        *last = id;
+        *self.last.last_mut().unwrap() = id;
     }
     fn i32(&mut self, id: i16, v: i32) {
         self.field(id, 5);
