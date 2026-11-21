@@ -648,7 +648,64 @@ extern "C" fn on_fault(sig: libc::c_int) {
 /// Set when engine 2 starts writing output (see the panic hook in `run`).
 static WRITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// SS_PROBE=1 (board probe only): print scorer facts and memory micro-timings to stderr.
+fn probe_facts() {
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{}>", e));
+    for p in ["/sys/kernel/mm/transparent_hugepage/enabled", "/sys/kernel/mm/transparent_hugepage/defrag",
+              "/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "/sys/fs/cgroup/cpu.max",
+              "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/cpuset.cpus.effective", "/proc/version",
+              "/proc/sys/kernel/numa_balancing", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"] {
+        eprintln!("PROBE {} = {}", p, rd(p).trim());
+    }
+    let ci = rd("/proc/cpuinfo");
+    for key in ["model name", "cpu MHz", "cache size", "siblings", "cpu cores", "flags"] {
+        if let Some(l) = ci.lines().find(|l| l.starts_with(key)) {
+            let l = if key == "flags" { format!("flags has avx512f={} avx2={}", l.contains("avx512f"), l.contains("avx2")) } else { l.to_string() };
+            eprintln!("PROBE cpuinfo {}", l);
+        }
+    }
+    eprintln!("PROBE cpus {}", ci.lines().filter(|l| l.starts_with("processor")).count());
+    for l in rd("/proc/meminfo").lines().take(8) {
+        eprintln!("PROBE meminfo {}", l);
+    }
+    for l in rd("/proc/self/mountinfo").lines().filter(|l| l.contains(" /data ") || l.contains(" /output ") || l.contains(" /scratch ") || l.contains(" /tmp ")) {
+        eprintln!("PROBE mount {}", l);
+    }
+    for l in rd("/proc/self/status").lines().filter(|l| l.starts_with("Cpus_allowed_list") || l.starts_with("THP")) {
+        eprintln!("PROBE status {}", l);
+    }
+    // fresh-page cost: 256 MB anon, touched once per 4 KB, default / MADV_HUGEPAGE / NOHUGEPAGE
+    for (name, adv) in [("default", -1), ("hugepage", libc::MADV_HUGEPAGE), ("nohugepage", libc::MADV_NOHUGEPAGE)] {
+        let n = 256usize << 20;
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) } as *mut u8;
+        if adv >= 0 {
+            unsafe { libc::madvise(p as *mut libc::c_void, n, adv) };
+        }
+        let mut ru0: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru0) };
+        let t = std::time::Instant::now();
+        let mut o = 0;
+        while o < n {
+            unsafe { *p.add(o) = 1 };
+            o += 4096;
+        }
+        let ft = t.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        unsafe { std::ptr::write_bytes(p, 7, n) };
+        let wt = t2.elapsed().as_secs_f64();
+        let mut ru1: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru1) };
+        let t3 = std::time::Instant::now();
+        unsafe { libc::munmap(p as *mut libc::c_void, n) };
+        eprintln!("PROBE fault256MB {} first-touch {:.1} ms, minflt {}, rewrite {:.1} ms ({:.1} GB/s), munmap {:.1} ms",
+            name, ft * 1e3, ru1.ru_minflt - ru0.ru_minflt, wt * 1e3, n as f64 / wt / 1e9, t3.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
 pub fn run(data: &Path, out: &Path) -> bool {
+    if std::env::var("SS_PROBE").is_ok() {
+        probe_facts();
+    }
     let t0 = std::time::Instant::now();
     // Insurance: a panic in engine 2 before any output is written re-executes this binary with
     // engine 2 off (SS_E2=0), so unexpected data costs time, never a crash. Once writing has
@@ -1664,7 +1721,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
             }
         }
-        let n = (0..ncamp * ndays).filter(|&i| camp[i][0] != 0 || camp[i][3] != 0).count();
+        let mut probe_drop = std::env::var("SS_PROBE").is_ok();
+        let n = (0..ncamp * ndays).filter(|&i| camp[i][0] != 0 || camp[i][3] != 0).count() - probe_drop as usize;
         let mut c = [
             Col::new("campaign_id", Kind::Str, n),
             Col::new("channel", Kind::Str, n),
@@ -1678,6 +1736,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
             for d in 0..ndays {
                 let v = camp[ci * ndays + d];
                 if v[0] == 0 && v[3] == 0 {
+                    continue;
+                }
+                if probe_drop {
+                    probe_drop = false; // SS_PROBE: one missing row makes the dev check fail and return the logs
                     continue;
                 }
                 if ci as u32 == organic {

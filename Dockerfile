@@ -14,4 +14,7 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 FROM scratch
 COPY --from=build /sessions /sessions
 # Runs as uid 1000 with a read-only root; reads DATA_DIR, writes OUTPUT_DIR only.
+# BOARD PROBE ONLY (branch probe): print scorer facts and phase laps, drop one campaign row so
+# the dev check fails and returns the logs. Never the entry.
+ENV SS_PROBE=1 SS_VERBOSE=1
 CMD ["/sessions"]
