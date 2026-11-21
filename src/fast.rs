@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use super::scan::{scan, scan2, scan3, scan3a, Line};
 
 const NB: usize = 256;
+/// Typical click line length in bytes, a little low on purpose: sizes the per-group click vector
+/// (bytes / this). Only a capacity hint: a denser file just makes the vector grow.
+const CK_LINE_EST: usize = 40;
 const FB: u64 = 1 << 63;
 const NONE: u64 = u64::MAX;
 
@@ -134,6 +137,57 @@ unsafe fn pack16(p: *const u8, n: usize) -> Option<u64> {
 }
 
 type Fb = Vec<(u64, &'static [u8])>;
+
+/// Small id -> value table keyed by the exact `pack` key (campaign ids): one multiply and usually
+/// one 16-byte probe instead of hashing the bytes and comparing slices. Ids that do not pack
+/// (longer than 10 bytes or outside the alphabet) are not stored here; `get` sends them to the Dict.
+struct PackTab {
+    mask: usize,
+    /// (pack key, value); key 0 = empty slot (a packed non-empty id is never 0).
+    slots: Vec<(u64, u32)>,
+}
+impl PackTab {
+    /// `entries`: the Dict's (id, value) pairs, each id once.
+    fn new<'x>(entries: impl Iterator<Item = (&'x [u8], u32)> + Clone) -> Self {
+        let cap = (entries.clone().count() * 4).max(16).next_power_of_two();
+        let mut t = PackTab { mask: cap - 1, slots: vec![(0, 0); cap] };
+        for (id, v) in entries {
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(k) = pack(id) {
+                let mut i = mix(k) as usize & t.mask;
+                while t.slots[i].0 != 0 && t.slots[i].0 != k {
+                    i = (i + 1) & t.mask;
+                }
+                if t.slots[i].0 == 0 {
+                    t.slots[i] = (k, v);
+                }
+            }
+        }
+        t
+    }
+    /// Same answer as `dict.get(id)` when `self` was built from all of `dict`'s entries. `id` is non-empty.
+    #[inline]
+    fn get(&self, id: &[u8], dict: &Dict) -> Option<u32> {
+        match pack(id) {
+            Some(k) => {
+                let mut i = mix(k) as usize & self.mask;
+                loop {
+                    let s = self.slots[i];
+                    if s.0 == k {
+                        return Some(s.1);
+                    }
+                    if s.0 == 0 {
+                        return None;
+                    }
+                    i = (i + 1) & self.mask;
+                }
+            }
+            None => dict.get(id),
+        }
+    }
+}
 
 #[inline]
 fn key_of(b: &'static [u8], fb: &mut Fb) -> u64 {
@@ -628,6 +682,18 @@ impl LinkTab {
             _mm_prefetch(self.slots.as_ptr().add(self.home(k)) as *const i8, _MM_HINT_T0);
         }
     }
+    #[inline]
+    fn prefetch_filter(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if !self.nf.is_empty() {
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(self.nf.as_ptr().add((Self::fbit(k) & self.fmask) >> 6) as *const i8, _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
+    }
     /// Resolve keys in place, prefetching DIST lookups ahead.
     fn resolve_all(&self, ks: &mut [u64]) {
         const DIST: usize = 16;
@@ -644,6 +710,67 @@ impl LinkTab {
             ks[i] = self.get(ks[i]);
         }
     }
+}
+
+/// Person partitions (see `run`).
+const NP: usize = 256;
+#[inline]
+fn ppart(k: u64) -> usize {
+    (mix(k ^ 0x5bd1_e995) >> 56) as usize
+}
+
+/// Clicks of one parse group: user key -> person key in place (same result as
+/// `LinkTab::resolve_all`), then scattered by person partition into exactly sized vectors,
+/// in input order within each partition.
+fn resolve_scatter(raw: &mut [Ck], ltab: &LinkTab) -> Vec<Vec<Ck>> {
+    let cnt = resolve_count(raw, ltab);
+    let mut outp: Vec<Vec<Ck>> = cnt.iter().map(|&n| Vec::with_capacity(n as usize)).collect();
+    for c in raw.iter() {
+        outp[ppart(c.pkey)].push(*c);
+    }
+    outp
+}
+
+/// First half of `resolve_scatter`: person keys in place, and how many clicks each partition gets.
+/// Works in blocks so the filter words and the table slots of a block are prefetched before
+/// they are read, with no per-group side arrays.
+fn resolve_count(raw: &mut [Ck], ltab: &LinkTab) -> [u32; NP] {
+    const B: usize = 256;
+    let mut cnt = [0u32; NP];
+    let mut todo = [0u16; B];
+    for blk in raw.chunks_mut(B) {
+        for c in blk.iter() {
+            ltab.prefetch_filter(c.pkey);
+        }
+        let mut m = 0usize;
+        for (i, c) in blk.iter().enumerate() {
+            // only ids the filter flags can map to another id; the rest are their own person
+            if ltab.maybe_linked(c.pkey) {
+                todo[m] = i as u16;
+                m += 1;
+                ltab.prefetch(c.pkey);
+            }
+        }
+        for &i in &todo[..m] {
+            let c = &mut blk[i as usize];
+            c.pkey = ltab.get(c.pkey);
+        }
+        for c in blk.iter() {
+            cnt[ppart(c.pkey)] += 1;
+        }
+    }
+    cnt
+}
+
+/// The previous resolve + scatter (SS_CKOLD=1), kept as the oracle for `resolve_scatter`.
+fn resolve_scatter_old(raw: &[Ck], ltab: &LinkTab) -> Vec<Vec<Ck>> {
+    let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
+    let mut ks: Vec<u64> = raw.iter().map(|c| c.pkey).collect();
+    ltab.resolve_all(&mut ks);
+    for (c, &pk) in raw.iter().zip(ks.iter()) {
+        outp[ppart(pk)].push(Ck { pkey: pk, ..*c });
+    }
+    outp
 }
 
 /// Link table from the parsed id pairs: id key -> key of the byte-wise smallest id of its
@@ -784,6 +911,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
     }
     let organic = camp_names.len() as u32;
+    let camp_tab = PackTab::new(camp_names.iter().enumerate().map(|(i, c)| (c.0, i as u32)));
 
     let (ev_maps, (ck_maps, lk_maps)): (Vec<Mmap>, (Vec<Mmap>, Vec<Mmap>)) = rayon::join(
         || open_all(&list_csv(&data.join("events"))),
@@ -1299,7 +1427,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
         groups
             .par_iter()
             .map(|grp| {
-                let mut raw: Vec<Ck> = Vec::new();
+                // Reserved once (untouched pages cost nothing) instead of growing by doubling.
+                let mut raw: Vec<Ck> = Vec::with_capacity(grp.iter().map(|c| c.2 - c.1).sum::<usize>() / CK_LINE_EST);
                 let mut fb = Fb::new();
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
@@ -1313,7 +1442,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         if ts == BAD || ts < cws || ts >= we {
                             return;
                         }
-                        let camp = match f[2].and_then(|c| camp_map.get(c)) {
+                        let camp = match f[2].and_then(|c| camp_tab.get(c, &camp_map)) {
                             Some(c) => c,
                             None => return,
                         };
@@ -1336,6 +1465,101 @@ pub fn run(data: &Path, out: &Path) -> bool {
         None => return false,
     };
     lap(&format!("links ({} ids) and events parsed", ltab.n));
+    if std::env::var("SS_CKBENCH").is_ok() {
+        // Diagnostic: cumulative cost of the click path over the real groups (fresh state per run).
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let cpu = || {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            (tv(ru.ru_utime), tv(ru.ru_stime))
+        };
+        let ch = chunks(ck_maps);
+        let groups = split_groups(&ch, nthreads * 2);
+        let flagged = AtomicU64::new(0);
+        let names = ["scan", "+ts/window", "+campaign", "+2 keys", "+push (parse as shipped)", "+resolve+scatter (old)", "+resolve_scatter (new, instead)", "+resolve_count only (new)", "whole click path, new"];
+        let rounds: usize = std::env::var("SS_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        for stage in 0..names.len() {
+            let mut best = (f64::MAX, f64::MAX, f64::MAX);
+            let (mut rows, mut last_sum) = (0u64, 0u64);
+            for _ in 0..rounds {
+                let (sink, cnt) = (AtomicU64::new(0), AtomicU64::new(0));
+                let (c0, t) = (cpu(), std::time::Instant::now());
+                groups.par_iter().for_each(|grp| {
+                    let mut raw: Vec<Ck> = Vec::new();
+                    if stage == 8 {
+                        raw.reserve(grp.iter().map(|c| c.2 - c.1).sum::<usize>() / CK_LINE_EST);
+                    }
+                    let mut fb = Fb::new();
+                    let mut memo = TsMemo::default();
+                    let (mut acc, mut n) = (0u64, 0u64);
+                    for &(mi, s, e) in grp.iter() {
+                        let d: &'static [u8] = &ck_maps[mi][s..e];
+                        scan3a::<4>(d, |f| {
+                            let (cid, uid) = match (f[0], f[1]) {
+                                (Some(c), Some(u)) => (c, u),
+                                _ => return,
+                            };
+                            if stage == 0 {
+                                acc += (cid.len() + uid.len()) as u64;
+                                return;
+                            }
+                            let ts = parse_ts_memo(f[3], &mut memo);
+                            if ts == BAD || ts < cws || ts >= we {
+                                return;
+                            }
+                            if stage == 1 {
+                                acc = acc.wrapping_add(ts as u64);
+                                return;
+                            }
+                            let camp = match f[2].and_then(|c| if stage == 8 { camp_tab.get(c, &camp_map) } else { camp_map.get(c) }) {
+                                Some(c) => c,
+                                None => return,
+                            };
+                            if stage == 2 {
+                                acc = acc.wrapping_add(ts as u64 ^ camp as u64);
+                                return;
+                            }
+                            let c = Ck { pkey: key_of(uid, &mut fb), lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) };
+                            n += 1;
+                            if stage == 3 {
+                                acc = acc.wrapping_add(c.pkey ^ c.lo ^ c.cid);
+                                return;
+                            }
+                            raw.push(c);
+                        });
+                    }
+                    if stage == 7 {
+                        flagged.fetch_add(raw.iter().filter(|c| ltab.maybe_linked(c.pkey)).count() as u64, Relaxed);
+                        let cnt = resolve_count(&mut raw, &ltab);
+                        acc = acc.wrapping_add(cnt.iter().map(|&x| x as u64).sum::<u64>() );
+                    } else if stage == 6 || stage == 8 {
+                        let outp = resolve_scatter(&mut raw, &ltab);
+                        acc = acc.wrapping_add(outp.iter().map(|v| v.len() as u64 + v.last().map_or(0, |c| c.pkey)).sum::<u64>());
+                    } else if stage == 5 {
+                        let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
+                        let mut ks: Vec<u64> = raw.iter().map(|c| c.pkey).collect();
+                        ltab.resolve_all(&mut ks);
+                        for (c, &pk) in raw.iter().zip(ks.iter()) {
+                            outp[ppart(pk)].push(Ck { pkey: pk, ..*c });
+                        }
+                        acc = acc.wrapping_add(outp.iter().map(|v| v.len() as u64 + v.last().map_or(0, |c| c.pkey)).sum::<u64>());
+                    }
+                    acc = acc.wrapping_add(raw.len() as u64);
+                    sink.fetch_add(acc, Relaxed);
+                    cnt.fetch_add(n, Relaxed);
+                });
+                let (w, c1) = (t.elapsed().as_secs_f64(), cpu());
+                rows = rows.max(cnt.load(Relaxed));
+                last_sum = sink.load(Relaxed);
+                if c1.0 - c0.0 + c1.1 - c0.1 < best.1 + best.2 {
+                    best = (w, c1.0 - c0.0, c1.1 - c0.1);
+                }
+            }
+            eprintln!("ckbench stage {} {:<32} wall {:.4}s user {:.4}s sys {:.4}s rows {} sum {}", stage, names[stage], best.0, best.1, best.2, rows, last_sum);
+        }
+        std::process::exit(0);
+    }
     // The event and link files (and the clicks, when parsed early) are fully parsed. Drop their
     // page-table entries now, on a spare thread, instead of leaving ~1.9 GB of 4 KB file mappings
     // to be torn down serially at exit (~18 ms at 20M, inside the measured wall time).
@@ -1366,11 +1590,6 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // Person partitions: survivors and clicks are scattered by hash(person key) so each
     // partition is sorted on its own, in cache, instead of one global sort.
-    const NP: usize = 256;
-    #[inline]
-    fn ppart(k: u64) -> usize {
-        (mix(k ^ 0x5bd1_e995) >> 56) as usize
-    }
     // ---------------- dedup per bucket (smallest ingest wins; kept-but-invalid drops the event)
     let dedup_job = || -> Vec<Vec<Vec<(u64, u64)>>> {
         let ng = (nthreads * 4).min(NB);
@@ -1442,6 +1661,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
 
     // ---------------- clicks (no dedup needed: copies are identical), scattered by person
+    // SS_CKOLD=1 keeps the previous resolve + scatter (A/B and differential switch).
+    let old_ck = std::env::var("SS_CKOLD").is_ok();
     let ck_job = || -> (Vec<Vec<Vec<Ck>>>, Fb) {
         let raws: Vec<(Vec<Ck>, Fb)> = match ck_raw {
             Some(r) => r,
@@ -1449,13 +1670,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
         };
         let parts: Vec<(Vec<Vec<Ck>>, Fb)> = raws
             .into_par_iter()
-            .map(|(raw, fb)| {
-                let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
-                let mut ks: Vec<u64> = raw.iter().map(|c| c.pkey).collect();
-                ltab.resolve_all(&mut ks);
-                for (c, &pk) in raw.iter().zip(ks.iter()) {
-                    outp[ppart(pk)].push(Ck { pkey: pk, ..*c });
-                }
+            .map(|(mut raw, fb)| {
+                let outp = if old_ck { resolve_scatter_old(&raw, &ltab) } else { resolve_scatter(&mut raw, &ltab) };
                 (outp, fb)
             })
             .collect();
@@ -1954,6 +2170,102 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // Every output file is written and closed. Exit here, inside run(), so the multi-GB locals
     // above are never dropped (returning first would free them all, ~20 ms at 20M).
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn same(a: &[Vec<Ck>], b: &[Vec<Ck>]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| (p.pkey, p.lo, p.cid) == (q.pkey, q.lo, q.cid)))
+    }
+
+    #[test]
+    fn resolve_scatter_matches_the_old_path() {
+        let mut s = 0x2468_ace1_3579_bdf0u64;
+        for round in 0..60 {
+            // A link table of n ids in groups (some their own root), with and without the filter.
+            let n = [0usize, 1, 7, 300, 5000, 40000][round % 6];
+            let ids: Vec<u64> = (0..n).map(|_| (rng(&mut s) >> 4) | 1).collect();
+            let mut t = LinkTab::new(n);
+            for (i, &id) in ids.iter().enumerate() {
+                let root = if rng(&mut s) % 3 == 0 { id } else { ids[(rng(&mut s) % (i as u64 + 1)) as usize] };
+                t.insert(id, root);
+            }
+            if round % 2 == 0 {
+                t.build_filter();
+            }
+            // Every length around the block size, keys mixing linked ids, roots and strangers.
+            for len in [0usize, 1, 2, 255, 256, 257, 511, 512, 513, 1000, 70000] {
+                if len == 70000 && round % 10 != 0 {
+                    continue;
+                }
+                let raw: Vec<Ck> = (0..len)
+                    .map(|i| {
+                        let k = if n > 0 && rng(&mut s) % 3 != 0 { ids[(rng(&mut s) % n as u64) as usize] } else { (rng(&mut s) >> 4) | 1 };
+                        Ck { pkey: k, lo: i as u64, cid: rng(&mut s) }
+                    })
+                    .collect();
+                let want = resolve_scatter_old(&raw, &t);
+                let mut r2 = raw.clone();
+                let got = resolve_scatter(&mut r2, &t);
+                assert!(same(&want, &got), "round {} len {}", round, len);
+                assert!(got.iter().enumerate().all(|(p, v)| v.capacity() == v.len() && v.iter().all(|c| ppart(c.pkey) == p)));
+                // person keys are what the table says, one by one
+                assert!(raw.iter().zip(r2.iter()).all(|(a, b)| b.pkey == t.get(a.pkey) && (a.lo, a.cid) == (b.lo, b.cid)));
+            }
+        }
+    }
+
+    #[test]
+    fn pack_tab_matches_the_dict() {
+        let mut s = 0x0f1e_2d3c_4b5a_6978u64;
+        let alpha = b"abcXYZ019_-. \xff\x00";
+        for round in 0..300 {
+            let n = [0usize, 1, 3, 50, 2000][round % 5];
+            let mk = |s: &mut u64| -> Vec<u8> {
+                let len = 1 + (rng(s) % 13) as usize;
+                // mostly packable ids, some with bytes outside the alphabet or longer than 10
+                let wild = rng(s) % 4 == 0;
+                (0..len).map(|_| alpha[(rng(s) % if wild { alpha.len() as u64 } else { 10 }) as usize]).collect()
+            };
+            let names: Vec<Vec<u8>> = (0..n).map(|i| if i % 7 == 3 { format!("c_{}", i).into_bytes() } else { mk(&mut s) }).collect();
+            let mut dict = Dict::new(n * 2);
+            let mut uniq: Vec<(&[u8], u32)> = Vec::new();
+            for nm in &names {
+                if dict.get(nm).is_none() {
+                    dict.insert(nm, uniq.len() as u32);
+                    uniq.push((nm, uniq.len() as u32));
+                }
+            }
+            let tab = PackTab::new(uniq.iter().copied());
+            for nm in &names {
+                assert_eq!(tab.get(nm, &dict), dict.get(nm));
+            }
+            for i in 0..4000 {
+                let q = if i % 5 == 0 { format!("c_{}", rng(&mut s) % 3000).into_bytes() } else { mk(&mut s) };
+                assert_eq!(tab.get(&q, &dict), dict.get(&q), "{:?}", q);
+                // a present id with one byte changed or one byte appended
+                if n > 0 {
+                    let mut v = names[(rng(&mut s) % n as u64) as usize].clone();
+                    if i % 2 == 0 {
+                        let k = (rng(&mut s) % v.len() as u64) as usize;
+                        v[k] = alpha[(rng(&mut s) % alpha.len() as u64) as usize];
+                    } else {
+                        v.push(alpha[(rng(&mut s) % alpha.len() as u64) as usize]);
+                    }
+                    assert_eq!(tab.get(&v, &dict), dict.get(&v), "{:?}", v);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
