@@ -9,7 +9,7 @@
 
 use super::*;
 use std::collections::HashMap;
-use super::scan::scan;
+use super::scan::{scan, scan2};
 
 const NB: usize = 256;
 const FB: u64 = 1 << 63;
@@ -519,6 +519,40 @@ pub fn run(data: &Path, out: &Path) -> bool {
     if std::env::var("SS_PARSEBENCH").is_ok() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let sink = AtomicU64::new(0);
+        if std::env::var("SS_PARSEBENCH").as_deref() == Ok("scan") {
+            // Old vs new scanner alone over every event chunk, alternating, trivial closure.
+            let rounds: usize = std::env::var("SS_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+            let (lines, slow) = (AtomicU64::new(0), AtomicU64::new(0));
+            let bytes: usize = ev_chunks.iter().map(|c| c.2 - c.1).sum();
+            for r in 0..rounds * 2 {
+                let new = r % 2 == 1;
+                sink.store(0, Relaxed);
+                let t = std::time::Instant::now();
+                ev_chunks.par_iter().for_each(|&(mi, s, e)| {
+                    let d: &'static [u8] = &ev_maps[mi][s..e];
+                    let mut acc = 0u64;
+                    let mut f = |f: &[Option<&[u8]>; 7]| {
+                        acc = acc.wrapping_mul(31).wrapping_add(1);
+                        for x in f.iter() {
+                            acc = acc.wrapping_add(x.map_or(7, |x| x.len() as u64 ^ (x[0] as u64) << 8 ^ (x[x.len() - 1] as u64) << 16));
+                        }
+                    };
+                    if new {
+                        let st = scan2::<7>(d, &mut f);
+                        if r == 1 {
+                            lines.fetch_add(st.lines, Relaxed);
+                            slow.fetch_add(st.slow, Relaxed);
+                        }
+                    } else {
+                        scan::<7>(d, &mut f);
+                    }
+                    sink.fetch_add(acc, Relaxed);
+                });
+                eprintln!("scanbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
+            }
+            eprintln!("scanbench bytes {} lines {} slow {}", bytes, lines.load(Relaxed), slow.load(Relaxed));
+            std::process::exit(0);
+        }
         for stage in 0..6 {
             let t = std::time::Instant::now();
             ev_chunks.par_iter().for_each(|&(mi, s, e)| {
@@ -739,7 +773,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let d: &'static [u8] = &lk_maps[mi][s..e];
             let mut v = Vec::new();
             let mut fb = Fb::new();
-            scan::<2>(d, |f| {
+            scan2::<2>(d, |f| {
                 if let [Some(a), Some(b)] = *f {
                     v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
                 }
@@ -810,7 +844,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
-                    scan::<7>(d, |f| {
+                    scan2::<7>(d, |f| {
                         let eid = match f[0] {
                             Some(x) => x,
                             None => return,
@@ -946,7 +980,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ck_maps[mi][s..e];
-                    scan::<4>(d, |f| {
+                    scan2::<4>(d, |f| {
                         let (cid, uid) = match (f[0], f[1]) {
                             (Some(c), Some(u)) => (c, u),
                             _ => return,
