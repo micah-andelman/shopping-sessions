@@ -149,13 +149,28 @@ fn nunion(x: &mut u64, a: u32, b: u32) {
     }
 }
 
+/// At most `miss` samples fail `good` (stops at the first miss over the limit: wrong candidate
+/// keys fail almost every sample, so this usually reads one or two).
+#[inline]
+fn within(ws: &[u64], miss: usize, good: impl Fn(u64) -> bool) -> bool {
+    let mut m = 0;
+    for &w in ws {
+        if !good(w) {
+            m += 1;
+            if m > miss {
+                return false;
+            }
+        }
+    }
+    true
+}
 /// Recover the user key: some sample is alias 0 of a person < pb, so key = y0 ^ (P*512*M1) for
 /// one P; a candidate is accepted when every sample decodes to a person < pb.
 fn recover_user_key(ws: &[u64], pb: u64) -> Option<u64> {
     let ys: Vec<u64> = ws.iter().map(|&w| pre(w)).collect();
     // tolerant: a few sampled ids outside the dense range (not generator-shaped) are fine
-    let need = ws.len() - ws.len() / 10;
-    let ok = |k: u64| ws.iter().filter(|&&w| unscramble(w, k) >> 9 < pb).count() >= need;
+    let need = ws.len() - ws.len() / 24; // up to 2 of 48 may miss
+    let ok = |k: u64| within(ws, ws.len() - need, |w| unscramble(w, k) >> 9 < pb);
     for &y0 in ys.iter().take(8) {
         let hit = (0..pb).into_par_iter().find_any(|&p| ok(y0 ^ ((p << 9).wrapping_mul(M1) & MASK40)));
         if let Some(p) = hit {
@@ -167,8 +182,8 @@ fn recover_user_key(ws: &[u64], pb: u64) -> Option<u64> {
 /// Recover the event key: `y0`'s index is below `lim`; every sample must decode below `eb`.
 fn recover_event_key(ws: &[u64], w0: u64, lim: u64, eb: u64) -> Option<u64> {
     let y0 = pre(w0);
-    let need = ws.len() - ws.len() / 10;
-    let ok = |k: u64| ws.iter().filter(|&&w| unscramble(w, k) < eb).count() >= need;
+    let need = ws.len() - ws.len() / 24; // up to 2 of 48 may miss
+    let ok = |k: u64| within(ws, ws.len() - need, |w| unscramble(w, k) < eb);
     (0..lim).into_par_iter().find_any(|&i| ok(y0 ^ (i.wrapping_mul(M1) & MASK40))).map(|i| y0 ^ (i.wrapping_mul(M1) & MASK40))
 }
 
