@@ -323,6 +323,8 @@ struct Raw<T>(*mut T);
 unsafe impl<T> Send for Raw<T> {}
 unsafe impl<T> Sync for Raw<T> {}
 
+mod fast;
+
 fn main() {
     if let Some(n) = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()) {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global();
@@ -331,6 +333,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(if args.len() > 2 { args[1].clone() } else { env("DATA_DIR", "/data") });
     let out = PathBuf::from(if args.len() > 2 { args[2].clone() } else { env("OUTPUT_DIR", "/output") });
+    // SS_LEGACY forces the v4 path (for differential testing).
+    if std::env::var("SS_LEGACY").is_err() && fast::run(&data, &out) {
+        std::process::exit(0);
+    }
+    legacy(data, out);
+}
+
+/// v4 pipeline: byte-exact everywhere, no layout assumptions. Used when the fast path declines.
+fn legacy(data: PathBuf, out: PathBuf) {
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
