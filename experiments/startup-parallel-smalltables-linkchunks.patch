@@ -1,0 +1,70 @@
+diff --git a/src/fast.rs b/src/fast.rs
+index c865d91..732989e 100644
+--- a/src/fast.rs
++++ b/src/fast.rs
+@@ -343,8 +343,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
+     let ws_day = ws.div_euclid(DAY);
+     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
+ 
+-    let products = read_small(&data.join("products.csv"));
+-    let campaigns = read_small(&data.join("campaigns.csv"));
++    // small tables load while the input files are listed and mapped
++    let ((products, campaigns), (ev_maps, (ck_maps, lk_maps))): ((Vec<[Vec<u8>; 2]>, Vec<[Vec<u8>; 2]>), (Vec<Mmap>, (Vec<Mmap>, Vec<Mmap>))) = rayon::join(
++        || rayon::join(|| read_small(&data.join("products.csv")), || read_small(&data.join("campaigns.csv"))),
++        || {
++            rayon::join(
++                || open_all(&list_csv(&data.join("events"))),
++                || rayon::join(|| open_all(&list_csv(&data.join("clicks"))), || open_all(&list_csv(&data.join("links")))),
++            )
++        },
++    );
+     let mut cats: Vec<Vec<u8>> = products.iter().map(|r| r[1].clone()).collect();
+     cats.push(b"unknown".to_vec());
+     cats.sort();
+@@ -368,10 +376,6 @@ pub fn run(data: &Path, out: &Path) -> bool {
+     }
+     let organic = camp_names.len() as u32;
+ 
+-    let (ev_maps, (ck_maps, lk_maps)): (Vec<Mmap>, (Vec<Mmap>, Vec<Mmap>)) = rayon::join(
+-        || open_all(&list_csv(&data.join("events"))),
+-        || rayon::join(|| open_all(&list_csv(&data.join("clicks"))), || open_all(&list_csv(&data.join("links")))),
+-    );
+     let ev_maps: &'static [Mmap] = Vec::leak(ev_maps);
+     let ck_maps: &'static [Mmap] = Vec::leak(ck_maps);
+     let lk_maps: &'static [Mmap] = Vec::leak(lk_maps);
+@@ -519,7 +523,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
+     // Links are small: parse them first on all threads, so the serial tail below (sort, index,
+     // union-find, table) runs on one thread WHILE the events parse on the others, instead of
+ // the link chunks queueing behind the big event groups and the tail running alone after.
+-    let lk_chunks = chunks(lk_maps);
++    // links are small (tens of MB): 256 KB chunks so every thread shares the link parse
++    let lk_chunks = chunks_sized(lk_maps, chunk_size().min(256 << 10));
+     let parts: Vec<(Vec<(u64, u64)>, Fb)> = lk_chunks
+         .par_iter()
+         .map(|&(mi, s, e)| {
+diff --git a/src/main.rs b/src/main.rs
+index c45e38f..4c6ae5a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -77,6 +77,12 @@ fn chunk_size() -> usize {
+ 
+ /// Byte ranges (map index, start, end) of data lines (each file's header line skipped), biggest first.
+ fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
++    chunks_sized(maps, chunk_size())
++}
++
++/// Like `chunks`, with an explicit target chunk size (small inputs use smaller chunks for parallelism).
++fn chunks_sized(maps: &[Mmap], size: usize) -> Vec<(usize, usize, usize)> {
++    let size = size.max(1);
+     let mut out = Vec::new();
+     for (i, m) in maps.iter().enumerate() {
+         let d: &[u8] = m;
+@@ -86,7 +92,7 @@ fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
+         };
+         let mut s = start;
+         while s < d.len() {
+-            let mut e = (s + chunk_size()).min(d.len());
++            let mut e = (s + size).min(d.len());
+             if e < d.len() {
+                 e = match memchr::memchr(b'\n', &d[e..]) {
+                     Some(p) => e + p + 1,
