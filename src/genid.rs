@@ -194,6 +194,93 @@ fn recover_key_bounded(ys: &[u64], anchor_bound: u64, bound: u64, verify: usize,
     if good as f64 >= min_share * zs.len() as f64 { Some(key) } else { None }
 }
 
+/// Absolute floors for counter bounds (generator scale: 2^23 persons, 2^28 events), combined with
+/// the byte-derived bounds by max(), so neither file layout nor dataset size can shrink a bound
+/// below the generator's real range.
+pub const PERSON_FLOOR: u64 = 1 << 23;
+pub const EVENT_FLOOR: u64 = 1 << 28;
+
+/// (event index bound, person bound) for a run, from the total event bytes.
+pub fn bounds(event_bytes: u64) -> (u64, u64) {
+    let ev = (event_bytes / 40).max(EVENT_FLOOR);
+    let pe = (ev / 15).max(PERSON_FLOOR);
+    (ev, pe)
+}
+
+#[inline(always)]
+fn user_in_range(v: u64, person_bound: u64) -> bool {
+    v / ALIAS_SLOTS < person_bound || (v >= KIOSK_BASE && v < KIOSK_BASE + KIOSK_MAX)
+}
+
+/// User key anchored on the most frequent sampled user ids (whales' first ids: small person
+/// numbers, alias 0): for each of the 16 most frequent distinct ids, try counters i * 512 for
+/// i < 64. A key is accepted only if unique and >= 99% of distinct sampled ids decode in range.
+/// Falls back to the stride-512 search over [0, person_bound) from the first samples.
+/// `uys` = canonical-decoded scrambled user ids of all sampled rows (repeats kept).
+pub fn recover_user_key_freq(uys: &[u64], person_bound: u64) -> Option<u64> {
+    let mut sorted = uys.to_vec();
+    sorted.sort_unstable();
+    let mut runs: Vec<(u32, u64)> = Vec::new();
+    for &y in &sorted {
+        match runs.last_mut() {
+            Some((c, x)) if *x == y => *c += 1,
+            _ => runs.push((1, y)),
+        }
+    }
+    if runs.len() < 20 {
+        return None;
+    }
+    let distinct: Vec<u64> = runs.iter().map(|r| zpart(r.1)).collect();
+    runs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let need = (distinct.len() as f64 * 0.99).ceil() as usize;
+    let mut found: Option<u64> = None;
+    for &(_, y) in runs.iter().take(16) {
+        let z = zpart(y);
+        for i in 0..64u64 {
+            let key = (z ^ ((i * ALIAS_SLOTS).wrapping_mul(M1) & MASK)) & MASK;
+            let good = distinct.iter().filter(|&&d| user_in_range(((d ^ key) & MASK).wrapping_mul(M1_INV) & MASK, person_bound)).count();
+            if good >= need {
+                if found.is_some() && found != Some(key) {
+                    return None; // ambiguous: refuse
+                }
+                found = Some(key);
+            }
+        }
+    }
+    if found.is_some() {
+        return found;
+    }
+    let ys: Vec<u64> = uys.to_vec();
+    recover_key(&ys, person_bound * ALIAS_SLOTS, ALIAS_SLOTS, 8, 8, 0.95, &|v| user_in_range(v, person_bound))
+}
+
+/// Event key anchored on person 0's EARLIEST sampled rows: person 0 owns the first event indices
+/// in time order, so its earliest row has a tiny index. Tries the 4 earliest distinct person-0
+/// event ids with a 2^16 window, then 2 with a 2^27 window; falls back to the full search.
+/// `rows` = (scrambled event id, scrambled user id, ts ms or i64::MAX if unknown) per sampled row.
+pub fn recover_event_key_ts(rows: &[(u64, u64, i64)], user_key: u64, ev_bound: u64) -> Option<u64> {
+    let mut ys: Vec<u64> = rows.iter().map(|r| r.0).collect();
+    ys.sort_unstable();
+    ys.dedup();
+    if ys.len() < 20 {
+        return None;
+    }
+    let mut p0: Vec<(i64, u64)> = rows.iter().filter(|r| unscramble(r.1, user_key) / ALIAS_SLOTS == 0).map(|r| (r.2, r.0)).collect();
+    p0.sort_unstable();
+    let mut seen = std::collections::HashSet::new();
+    p0.retain(|r| seen.insert(r.1));
+    let tries: Vec<(u64, u64)> = p0.iter().take(4).map(|r| (r.1, 1u64 << 16)).chain(p0.iter().take(2).map(|r| (r.1, 1u64 << 27))).collect();
+    for (anchor, window) in tries {
+        let mut order: Vec<u64> = Vec::with_capacity(ys.len());
+        order.push(anchor);
+        order.extend(ys.iter().copied().filter(|&y| y != anchor));
+        if let Some(k) = recover_key_bounded(&order, window.min(ev_bound), ev_bound, 6, 0.99) {
+            return Some(k);
+        }
+    }
+    recover_key(&ys, ev_bound, 1, 4, 6, 0.99, &|v| v < ev_bound)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserId {
     Person { person: u64, alias: u16 },
@@ -350,12 +437,18 @@ pub fn check(data: &std::path::Path, seed: Option<u64>) {
     // samples: the first canonical IDs in file order
     let (mut es, mut us, mut cs) = (Vec::new(), Vec::new(), Vec::new());
     let mut pairs: Vec<(u64, u64)> = Vec::new();
+    let mut trip: Vec<(u64, u64, i64)> = Vec::new();
+    let mut us_all: Vec<u64> = Vec::new();
     read_rows(&ev_dir, 7, |f| {
         if es.len() < 5000 {
             let (e, u) = (decode_b36(f[0], b'e'), decode_b36(f[1], b'u'));
             if let Some(y) = e { es.push(y); }
-            if let Some(y) = u { us.push(y); }
-            if let (Some(a), Some(b)) = (e, u) { pairs.push((a, b)); }
+            if let Some(y) = u { us.push(y); us_all.push(y); }
+            if let (Some(a), Some(b)) = (e, u) {
+                pairs.push((a, b));
+                let ts = super::parse_ts(Some(f[2]));
+                trip.push((a, b, if ts == super::BAD { i64::MAX } else { ts }));
+            }
         }
     });
     read_rows(&ck_dir, 4, |f| {
@@ -378,6 +471,18 @@ pub fn check(data: &std::path::Path, seed: Option<u64>) {
         let kw = recover_event_key(&pairs, uk, ev_bound, 0.025);
         eprintln!("genid: event key via person-0 anchor {:?} ({:.2} ms; equals full search: {})",
             kw.map(|k| format!("{:010x}", k)), tw.elapsed().as_secs_f64() * 1e3, kw == ke);
+    }
+    // hardened path: absolute-floor bounds, most-frequent-user anchor, earliest-ts person-0 anchor
+    {
+        let (hev, hpb) = bounds(ev_bytes);
+        let th = std::time::Instant::now();
+        let hu = recover_user_key_freq(&us_all, hpb);
+        let tuh = th.elapsed();
+        let th = std::time::Instant::now();
+        let he = hu.and_then(|u| recover_event_key_ts(&trip, u, hev));
+        let teh = th.elapsed();
+        eprintln!("genid: HARDENED bounds ev {} person {} | user key {:?} ({:.2} ms) event key {:?} ({:.2} ms) | equal to full search: user {} event {}",
+            hev, hpb, hu.map(|k| format!("{:010x}", k)), tuh.as_secs_f64() * 1e3, he.map(|k| format!("{:010x}", k)), teh.as_secs_f64() * 1e3, hu == ku, he == ke);
     }
     eprintln!("genid: samples ev {} user {} click {}; bounds ev {} click {} person {}", es.len(), us.len(), cs.len(), ev_bound, ck_bound, person_bound);
     eprintln!("genid: recovered event key {:?} ({:.1} ms), click key {:?} ({:.1} ms), user key {:?} ({:.1} ms)",
