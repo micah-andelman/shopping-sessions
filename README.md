@@ -20,7 +20,7 @@ A Rust pipeline for the Databricks Shopping Sessions track (`src/`). The Dockerf
 All code here was written by our team during the event. Ideas we learned from other teams' public write-ups and then implemented our own way:
 - Order-preserving packed integer ID keys: Wolverines, axhiao, Th3r0n.
 - Background read-ahead for cold-cache input: Eagle Eye.
-- Decoding the generator's scrambled IDs to counters (key recovery from a sample, direct-indexed dedup, person arithmetic for identity): Team 67's public design, read for ideas only; the code in `src/fast/e2.rs` is ours.
+- Decoding the generator's scrambled IDs to counters (key recovery from a sample, direct-indexed dedup, person arithmetic for identity): Team 67's public design and jason-scheffel/express-lane (key recovery anchored on frequent user IDs and person 0's earliest events), read for ideas only; the code in `src/fast/e2.rs` and `src/genid.rs` is ours.
 - Bitmask-based SIMD CSV scanning, hash-partitioned dedup, and person partitioning instead of a global sort: several teams, including enkyuan/polaris and Wolverines.
 
 Libraries: memmap2, memchr, rayon, hashbrown, foldhash, mimalloc, arrow-array, arrow-schema, parquet (all MIT or Apache-2.0).

@@ -523,11 +523,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
         if end < d.len() {
             end = memchr::memrchr(b'\n', &d[start..end]).map_or(start, |p| start + p + 1);
         }
-        let mut rows: Vec<(u64, u64)> = Vec::new();
+        let mut rows: Vec<(u64, u64, i64)> = Vec::new();
+        let mut memo = TsMemo::default();
         scan3a::<7>(&d[start..end], |f| {
             if let (Some(e), Some(u)) = (f[0], f[1]) {
                 if let (Some(we_), Some(wu)) = (b36(e, b'e'), b36(u, b'u')) {
-                    rows.push((we_, wu));
+                    let ts = parse_ts_memo(f[2], &mut memo);
+                    rows.push((we_, wu, if ts == BAD { i64::MAX } else { ts }));
                 }
             }
         });
@@ -537,24 +539,39 @@ pub fn run(data: &Path, out: &Path) -> bool {
         if us.len() < 24 || rows.len() < 24 {
             return decline("too few canonical sample ids");
         }
-        // spread the user sample over the list (sorted by scrambled value = random order)
-        let step = (us.len() / 48).max(1);
-        let usample: Vec<u64> = us.iter().step_by(step).take(48).copied().collect();
-        let ku = match recover_user_key(&usample, pb) {
+        // claude-45's genid recovery first (frequency anchors, absolute bounds), then ours
+        let (geb, gpb) = super::super::genid::bounds(ev_bytes as u64);
+        let uys: Vec<u64> = rows.iter().map(|r| r.1).collect();
+        let ku = match super::super::genid::recover_user_key_freq(&uys, gpb) {
             Some(k) => k,
-            None => return decline("user key not found"),
+            None => {
+                let step = (us.len() / 48).max(1);
+                let usample: Vec<u64> = us.iter().step_by(step).take(48).copied().collect();
+                match recover_user_key(&usample, pb) {
+                    Some(k) => k,
+                    None => return decline("user key not found"),
+                }
+            }
         };
-        let mut withp: Vec<(u64, u64)> = rows.iter().filter_map(|&(e, u)| {
-            let v = unscramble(u, ku);
-            if v & 511 < 512 && v >> 9 < pb { Some((v >> 9, e)) } else { None }
-        }).collect();
-        withp.sort_unstable();
-        let esample: Vec<u64> = rows.iter().step_by((rows.len() / 48).max(1)).take(48).map(|r| r.0).collect();
-        let (p0, w0) = withp[0];
-        let lim = if p0 == 0 { (ebound / 40 + 4096).min(ebound) } else { ebound };
-        let ke = match recover_event_key(&esample, w0, lim, ebound) {
+        let ke = match super::super::genid::recover_event_key_ts(&rows, ku, geb) {
             Some(k) => k,
-            None => return decline("event key not found"),
+            None => {
+                let mut withp: Vec<(u64, u64)> = rows.iter().filter_map(|&(e, u, _)| {
+                    let v = unscramble(u, ku);
+                    if v >> 9 < pb { Some((v >> 9, e)) } else { None }
+                }).collect();
+                withp.sort_unstable();
+                if withp.is_empty() {
+                    return decline("event key not found");
+                }
+                let esample: Vec<u64> = rows.iter().step_by((rows.len() / 48).max(1)).take(48).map(|r| r.0).collect();
+                let (p0, w0) = withp[0];
+                let lim = if p0 == 0 { (ebound / 40 + 4096).min(ebound) } else { ebound };
+                match recover_event_key(&esample, w0, lim, ebound) {
+                    Some(k) => k,
+                    None => return decline("event key not found"),
+                }
+            }
         };
         (ku, ke)
     };
