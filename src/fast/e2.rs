@@ -221,55 +221,127 @@ struct Line4([[u64; 2]; 4]);
 /// Write-combining bucket: records are staged in one line (all buckets' staging lines stay in
 /// cache) and full lines go out with non-temporal stores, so the scatter does no
 /// read-for-ownership of its target lines.
+///
+/// Lines go into a fixed region of the record arena (`a`, `acap` lines; see the parse setup), so
+/// the dedup can later write the bucket's survivor stream over the same, already-faulted pages.
+/// Lines past the region go to `over` (rare: the region has 25% headroom).
 struct Wc4 {
-    lines: Vec<Line4>,
+    a: *mut Line4,
+    alen: usize,
+    acap: usize,
+    over: Vec<Line4>,
     n: usize,
     buf: Line4,
 }
+// Safety: the region belongs to this Wc4 (one writer during the parse, one reader in the dedup).
+unsafe impl Send for Wc4 {}
 impl Wc4 {
     fn new() -> Self {
-        Wc4 { lines: Vec::new(), n: 0, buf: Line4([[0; 2]; 4]) }
+        Wc4 { a: std::ptr::null_mut(), alen: 0, acap: 0, over: Vec::new(), n: 0, buf: Line4([[0; 2]; 4]) }
+    }
+    fn with_region(a: *mut Line4, acap: usize) -> Self {
+        Wc4 { a, alen: 0, acap, over: Vec::new(), n: 0, buf: Line4([[0; 2]; 4]) }
     }
     #[inline(always)]
-    fn push(&mut self, r: [u64; 2], cap_lines: usize) {
+    fn push(&mut self, r: [u64; 2], _cap_lines: usize) {
         self.buf.0[self.n & 3] = r;
         self.n += 1;
         if self.n & 3 == 0 {
-            if self.lines.len() == self.lines.capacity() {
-                self.lines.reserve(self.lines.capacity().max(cap_lines));
-            }
-            unsafe {
-                let dst = self.lines.as_mut_ptr().add(self.lines.len());
-                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-                {
-                    use std::arch::x86_64::*;
-                    let s = &self.buf as *const Line4 as *const __m256i;
-                    let d = dst as *mut __m256i;
-                    _mm256_stream_si256(d, _mm256_load_si256(s));
-                    _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+            if self.alen < self.acap {
+                unsafe {
+                    let dst = self.a.add(self.alen);
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    {
+                        use std::arch::x86_64::*;
+                        let s = &self.buf as *const Line4 as *const __m256i;
+                        let d = dst as *mut __m256i;
+                        _mm256_stream_si256(d, _mm256_load_si256(s));
+                        _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                    std::ptr::write(dst, self.buf);
                 }
-                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-                std::ptr::write(dst, self.buf);
-                self.lines.set_len(self.lines.len() + 1);
+                self.alen += 1;
+            } else {
+                self.over.push(self.buf);
             }
         }
     }
     fn finish(&mut self) {
         if self.n & 3 != 0 {
-            self.lines.push(self.buf);
+            if self.alen < self.acap {
+                unsafe { std::ptr::write(self.a.add(self.alen), self.buf) };
+                self.alen += 1;
+            } else {
+                self.over.push(self.buf);
+            }
         }
     }
+    /// The records: the region's part, then the overflow part.
     #[inline]
-    fn as_slice(&self) -> &[[u64; 2]] {
-        unsafe { std::slice::from_raw_parts(self.lines.as_ptr() as *const [u64; 2], self.n) }
+    fn parts(&self) -> (&[[u64; 2]], &[[u64; 2]]) {
+        let ra = self.n.min(self.alen * 4);
+        let a = if ra == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(self.a as *const [u64; 2], ra) } };
+        let o = unsafe { std::slice::from_raw_parts(self.over.as_ptr() as *const [u64; 2], self.n - ra) };
+        (a, o)
     }
 }
 
 /// Survivors of one dedup bucket in index order: word 0 per event, plus one (person, start)
 /// header per run of one person.
+/// Survivor words: written into borrowed memory (the bucket's spent record region, never freed)
+/// or into an owned Vec; moves to an owned Vec if it ever fills.
+struct Sb {
+    p: *mut u64,
+    len: usize,
+    cap: usize,
+    own: Vec<u64>,
+}
+// Safety: `p` points into `own` or into the leaked record arena; one owner at a time.
+unsafe impl Send for Sb {}
+unsafe impl Sync for Sb {}
+impl Default for Sb {
+    fn default() -> Self {
+        Sb::owned(0)
+    }
+}
+impl Sb {
+    fn owned(n: usize) -> Self {
+        let mut own: Vec<u64> = Vec::with_capacity(n);
+        Sb { p: own.as_mut_ptr(), len: 0, cap: own.capacity(), own }
+    }
+    /// Safety: `p..p+cap` is writable, 8-byte aligned and outlives the Sb.
+    unsafe fn borrowed(p: *mut u64, cap: usize) -> Self {
+        Sb { p, len: 0, cap, own: Vec::new() }
+    }
+    #[inline(always)]
+    fn push(&mut self, x: u64) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        unsafe { *self.p.add(self.len) = x };
+        self.len += 1;
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let mut v: Vec<u64> = Vec::with_capacity((self.cap * 2).max(16));
+        v.extend_from_slice(self);
+        self.own = v;
+        self.p = self.own.as_mut_ptr();
+        self.cap = self.own.capacity();
+    }
+}
+impl std::ops::Deref for Sb {
+    type Target = [u64];
+    #[inline]
+    fn deref(&self) -> &[u64] {
+        unsafe { std::slice::from_raw_parts(self.p, self.len) }
+    }
+}
+
 #[derive(Default)]
 struct Sv {
-    w: Vec<u64>,
+    w: Sb,
     runs: Vec<(u32, u32)>,
 }
 impl Sv {
@@ -768,6 +840,25 @@ pub fn run(data: &Path, out: &Path) -> bool {
     }
     let est_rows = ev_bytes / 80;
     let bcap = (est_rows as f64 * 1.25 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
+    // One record arena: region (bucket b, worker t) = acap lines at (b * nthreads + t) * acap.
+    // Reserved, not committed: only written pages fault. Never unmapped (the dedup streams live
+    // in it until exit). If the mapping fails, every Wc4 uses its overflow Vec instead.
+    // SS_E2ACAP (test knob): region lines per (bucket, worker), to force the overflow paths
+    let acap = std::env::var("SS_E2ACAP").ok().and_then(|v| v.parse().ok()).unwrap_or(bcap / 4 + 1);
+    let arena_bytes = nbk * nthreads * acap * std::mem::size_of::<Line4>();
+    let arena: usize = {
+        let bytes = arena_bytes;
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+        };
+        if p == libc::MAP_FAILED {
+            0
+        } else {
+            unsafe { libc::madvise(p, bytes, libc::MADV_HUGEPAGE) };
+            p as usize
+        }
+    };
     // clicks per (worker, person bucket), generously: ~25 events per person, lines >= 36 bytes
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     let ccap = ck_bytes / 36 / ((est_rows / 25 >> CB) + 1) / nthreads * 2 + 64;
@@ -779,7 +870,15 @@ pub fn run(data: &Path, out: &Path) -> bool {
         .into_par_iter()
         .map(|t| {
             let mut w = Wk {
-                bk: (0..nbk).map(|_| std::cell::UnsafeCell::new(Wc4::new())).collect(),
+                bk: (0..nbk)
+                    .map(|b| {
+                        std::cell::UnsafeCell::new(if arena == 0 {
+                            Wc4::new()
+                        } else {
+                            Wc4::with_region(unsafe { (arena as *mut Line4).add((b * nthreads + t) * acap) }, acap)
+                        })
+                    })
+                    .collect(),
                 oddev: Vec::new(),
                 oddu: Vec::new(),
                 fb: Fb::new(),
@@ -1096,7 +1195,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
                 cur += 1;
                 for w in &wks {
-                    for r in unsafe { (*w.bk[b].get()).as_slice() } {
+                    let (ra, ro) = unsafe { (*w.bk[b].get()).parts() };
+                    for r in ra.iter().chain(ro) {
                         let s = (r[1] & (BSZ as u64 - 1)) as usize;
                         if gen[s] != cur || ing_of(r[1]) < ing_of(win[s][1]) {
                             win[s] = *r;
@@ -1104,7 +1204,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         }
                     }
                 }
-                let mut simple = Sv { w: Vec::with_capacity(n), runs: Vec::with_capacity(n / 16 + 16) };
+                // Every record is now in `win`, so the bucket's arena region (nthreads * acap
+                // lines, 8 words each) is spent: the survivor stream (<= n words) goes over it,
+                // onto pages that are already faulted.
+                let rcap = nthreads * acap * 8;
+                let sw = if arena != 0 && n <= rcap {
+                    unsafe { Sb::borrowed((arena as *mut Line4).add(b * nthreads * acap) as *mut u64, rcap) }
+                } else {
+                    Sb::owned(n)
+                };
+                let mut simple = Sv { w: sw, runs: Vec::with_capacity(n / 16 + 16) };
                 for s in 0..BSZ {
                     if gen[s] == cur && win[s][0] != NONE {
                         route(win[s][0], win[s][1], &mut simple, &mut cx);
@@ -1112,7 +1221,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
                 count_runs(&simple, &ecnt);
                 outs.push(simple);
-                // the bucket's records are done: free them now so later allocations reuse the pages
+                // the bucket's overflow records are done: free them (its arena region now holds the stream)
                 for w in &wks {
                     unsafe { *w.bk[b].get() = Wc4::new() };
                 }
@@ -1507,6 +1616,49 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     rayon::join(write_users, write_camps);
     lap("written");
+
+    // ---------------- release the big regions in parallel: the kernel's exit teardown is serial,
+    // MADV_DONTNEED on disjoint slices is not. Only buffers that are dead from here on (the outputs
+    // are written); never stacks or the input maps. SS_E2NOREL=1 turns it off (A/B).
+    if std::env::var("SS_E2NOREL").is_err() {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        if arena != 0 {
+            spans.push((arena, arena_bytes));
+        }
+        for w in &wks {
+            for v in &w.cks {
+                spans.push((v.as_ptr() as usize, v.capacity() * std::mem::size_of::<(u64, u64)>()));
+            }
+        }
+        for (v, o) in &cgrp {
+            spans.push((v.as_ptr() as usize, v.capacity() * std::mem::size_of::<(u64, u64)>()));
+            spans.push((o.as_ptr() as usize, o.capacity() * 4));
+        }
+        for (rows, _) in &results {
+            for c in &rows.c {
+                spans.push(c.buf_span());
+            }
+        }
+        // whole pages inside each span, cut at absolute 2 MB boundaries (no huge page is split)
+        const SL: usize = 2 << 20;
+        let mut sl: Vec<(usize, usize)> = Vec::new();
+        for (p, n) in spans {
+            if n < 1 << 18 {
+                continue;
+            }
+            let (a, e) = ((p + 4095) & !4095, (p + n) & !4095);
+            let mut s = a;
+            while s < e {
+                let t = ((s & !(SL - 1)) + SL).min(e);
+                sl.push((s, t - s));
+                s = t;
+            }
+        }
+        sl.par_iter().for_each(|&(p, n)| unsafe {
+            libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+        });
+        lap(&format!("released ({} slices)", sl.len()));
+    }
     std::process::exit(0)
 }
 
