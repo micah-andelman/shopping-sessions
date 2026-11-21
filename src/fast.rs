@@ -1428,7 +1428,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
         let tk = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
         eprintln!("{}  cpu user {:.2}s sys {:.2}s", hwm, tk(11), tk(12));
     }
-    true
+    // Every output file is written and closed. Exit here, inside run(), so the multi-GB locals
+    // above are never dropped (returning first would free them all, ~20 ms at 20M).
+    std::process::exit(0)
 }
 
 #[cfg(test)]
