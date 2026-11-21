@@ -497,7 +497,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
-            eprintln!("e2 {:>8.3}s  {}  [usr {:.3} sys {:.3}]", t0.elapsed().as_secs_f64(), what, tv(ru.ru_utime), tv(ru.ru_stime))
+            eprintln!("e2 {:>8.3}s  {}  [usr {:.3} sys {:.3} minflt {} majflt {}]", t0.elapsed().as_secs_f64(), what, tv(ru.ru_utime), tv(ru.ru_stime), ru.ru_minflt, ru.ru_majflt)
         }
     };
     let decline = |why: &str| {
@@ -682,6 +682,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let next = AtomicUsize::new(0);
     // SS_E2ABL=1..4 (diagnostic): stop the event row body after scan / +timestamps / +ID decode /
     // +all fields (no record write), print the parse time and exit.
+    let pop = std::env::var("SS_E2POP").map_or(false, |v| v == "1");
     let abl: u32 = std::env::var("SS_E2ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let wks: Vec<Wk> = (0..nthreads)
         .into_par_iter()
@@ -705,6 +706,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     break;
                 }
                 let (kind, mi, s, e) = jobs[j];
+                if pop {
+                    // map this chunk's input pages in one call instead of ~1 fault per 64 KB
+                    let m = match kind { 0 => &lk_maps[mi], 1 => &ck_maps[mi], _ => &ev_maps[mi] };
+                    let s0 = s & !4095;
+                    let _ = m.advise_range(memmap2::Advice::PopulateRead, s0, e - s0);
+                }
                 match kind {
                     0 => {
                         let d: &'static [u8] = &lk_maps[mi][s..e];
