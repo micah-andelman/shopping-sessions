@@ -18,3 +18,10 @@ Board scores vary about 20% across scoring machines, so one board number cannot 
 
 Rejected experiments (patches in `experiments/`): 16-byte dedup records, parallel binary-search link build,
 parallel small-table load with small link chunks.
+| v5.9 2nd draw | 4685e4a | - | - | 1.30 s | same commit as the 1.58 s draw: board noise ~20% |
+| A | 8fd1206 | 0.495 s | 1.544 s | 1.29 s | + link bit filter, exit inside run(), clicks parsed early |
+| v5.10 | HEAD | 0.519 s (cpu 3.63) | 1.751 s (cpu 12.25) vs 1.951 (13.96) same window | - | + early unmap (auditor), scan3 mask quote validation + prefetch (agent A); 60M = golden |
+
+Headline arm from 2:00 AM on: 8 threads on 4 physical cores (cores 0-7), warm, plus total CPU-seconds.
+Windows differ in load, so compare only rows measured in the same window.
+
