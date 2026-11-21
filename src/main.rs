@@ -280,11 +280,31 @@ fn parse_ts_fast(v: Option<&[u8]>) -> i64 {
 }
 
 /// Per-worker memo of the last valid date seen by parse_ts_memo: most rows share a few dates.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct TsMemo {
+    e: [TsMemoEntry; TS_MEMO],
+}
+
+impl Default for TsMemo {
+    fn default() -> Self {
+        TsMemo { e: [TsMemoEntry::default(); TS_MEMO] }
+    }
+}
+
+/// One remembered date: the 8 bytes "YYYY-MM-", the 2 bytes "DD", and its day number.
+#[derive(Clone, Copy, Default)]
+struct TsMemoEntry {
     a: u64,
     b: u64,
     days: i64,
+}
+
+/// Direct-mapped: a data set spans a few dozen dates and consecutive rows rarely share one.
+const TS_MEMO: usize = 32;
+
+#[inline(always)]
+fn ts_memo_slot(a: u64, bk: u64) -> usize {
+    ((a ^ bk << 5).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize
 }
 
 /// 8 ASCII digits (little-endian load, first digit lowest) -> value, or None.
@@ -355,8 +375,9 @@ fn parse_ts_memo(v: Option<&[u8]>, memo: &mut TsMemo) -> i64 {
             return BAD;
         }
         let bk = b & 0xFFFF;
-        let days = if a == memo.a && bk == memo.b {
-            memo.days
+        let slot = &mut memo.e[ts_memo_slot(a, bk)];
+        let days = if a == slot.a && bk == slot.b {
+            slot.days
         } else {
             let ad = a ^ 0x3030_3030_3030_3030;
             let y = by(ad, 0) * 1000 + by(ad, 1) * 100 + by(ad, 2) * 10 + by(ad, 3);
@@ -374,7 +395,7 @@ fn parse_ts_memo(v: Option<&[u8]>, memo: &mut TsMemo) -> i64 {
                 return BAD;
             }
             let days = days_from_civil(y, mo, d);
-            *memo = TsMemo { a, b: bk, days };
+            *slot = TsMemoEntry { a, b: bk, days };
             days
         };
         return (days * 86400 + h * 3600 + mi * 60 + s) * 1000 - off;
@@ -1248,6 +1269,47 @@ mod parse_fast_tests {
         *s ^= *s >> 7;
         *s ^= *s << 17;
         *s
+    }
+
+    #[test]
+    fn date_memo_table_matches_reference() {
+        // Many distinct dates through ONE memo, so slots collide, get evicted and get hit again:
+        // valid and invalid days (Feb 29/30, day 00/31/32, month 00/13), three formats, and a
+        // pool of repeated dates so that hits and misses interleave.
+        let mut s = 0x1357_9bdf_2468_ace0u64;
+        let mut memo = TsMemo::default();
+        let mut pool: Vec<(u64, u64, u64)> = Vec::new();
+        let (mut hits, mut valid) = (0u64, 0u64);
+        for round in 0..600_000u64 {
+            let (y, mo, d) = if !pool.is_empty() && rng(&mut s) % 4 != 0 {
+                pool[(rng(&mut s) % pool.len() as u64) as usize]
+            } else {
+                let y = [1970, 1999, 2000, 2024, 2026, 2027, 2028, 2100, 2400, 9999, 0][(rng(&mut s) % 11) as usize];
+                let x = (y, rng(&mut s) % 14, rng(&mut s) % 33);
+                if pool.len() < 300 {
+                    pool.push(x);
+                } else {
+                    let k = (rng(&mut s) % 300) as usize;
+                    pool[k] = x;
+                }
+                x
+            };
+            let (h, mi, sec) = (rng(&mut s) % 25, rng(&mut s) % 61, rng(&mut s) % 61);
+            let v = match round % 3 {
+                0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, sec),
+                1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", y, mo, d, h, mi, sec, if round % 2 == 0 { '+' } else { '-' }, rng(&mut s) % 25, rng(&mut s) % 61),
+                _ => format!("{}", 1_700_000_000_000u64 + rng(&mut s) % 200_000_000_000),
+            };
+            let want = parse_ts(Some(v.as_bytes()));
+            let before = memo.e;
+            assert_eq!(parse_ts_memo(Some(v.as_bytes()), &mut memo), want, "{}", v);
+            if want != BAD && round % 3 != 2 {
+                valid += 1;
+                hits += (0..TS_MEMO).all(|i| before[i].a == memo.e[i].a && before[i].b == memo.e[i].b) as u64;
+            }
+        }
+        // The test must really exercise both outcomes.
+        assert!(valid > 50_000 && hits > valid / 10 && hits < valid * 9 / 10, "valid {} hits {}", valid, hits);
     }
 
     #[test]
