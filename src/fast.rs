@@ -560,15 +560,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
                     let mut acc = 0u64;
                     let mut fb = Fb::new();
+                    let mut memo = TsMemo::default();
                     let mut f = |f: &[Option<&'static [u8]>; 7]| {
                         let eid = match f[0] {
                             Some(x) => x,
                             None => return,
                         };
                         let ekey = key_of(eid, &mut fb);
-                        let ing = parse_ts_fast(f[3]);
+                        let ing = parse_ts_memo(f[3], &mut memo);
                         let ing = if ing == BAD { i64::MAX } else { ing };
-                        let ts = parse_ts_fast(f[2]);
+                        let ts = parse_ts_memo(f[2], &mut memo);
                         let typ = match f[4] {
                             Some(b"view") => 0u8,
                             Some(b"cart") => 1,
