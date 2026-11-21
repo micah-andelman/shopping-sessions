@@ -19,7 +19,7 @@ use super::*;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 /// Board diagnostic switch (see `decline`).
-const DIAG_SLEEP: bool = true;
+const DIAG_SLEEP: bool = false;
 const MASK40: u64 = (1 << 40) - 1;
 const M1: u64 = 0x9E37_79B9_7F4B;
 const M2: u64 = 0xD6E8_FEB8_6659;
@@ -200,8 +200,61 @@ fn ing_of(w1: u64) -> u64 {
     (w1 >> 15) & ING_BAD
 }
 
+/// 64-byte line of four event records.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line4([[u64; 2]; 4]);
+/// Write-combining bucket: records are staged in one line (all buckets' staging lines stay in
+/// cache) and full lines go out with non-temporal stores, so the scatter does no
+/// read-for-ownership of its target lines.
+struct Wc4 {
+    lines: Vec<Line4>,
+    n: usize,
+    buf: Line4,
+}
+impl Wc4 {
+    fn new() -> Self {
+        Wc4 { lines: Vec::new(), n: 0, buf: Line4([[0; 2]; 4]) }
+    }
+    #[inline(always)]
+    fn push(&mut self, r: [u64; 2], cap_lines: usize) {
+        self.buf.0[self.n & 3] = r;
+        self.n += 1;
+        if self.n & 3 == 0 {
+            if self.lines.len() == self.lines.capacity() {
+                self.lines.reserve(self.lines.capacity().max(cap_lines));
+            }
+            unsafe {
+                let dst = self.lines.as_mut_ptr().add(self.lines.len());
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                {
+                    use std::arch::x86_64::*;
+                    let s = &self.buf as *const Line4 as *const __m256i;
+                    let d = dst as *mut __m256i;
+                    _mm256_stream_si256(d, _mm256_load_si256(s));
+                    _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                std::ptr::write(dst, self.buf);
+                self.lines.set_len(self.lines.len() + 1);
+            }
+        }
+    }
+    fn finish(&mut self) {
+        if self.n & 3 != 0 {
+            self.lines.push(self.buf);
+        }
+    }
+    #[inline]
+    fn as_slice(&self) -> &[[u64; 2]] {
+        unsafe { std::slice::from_raw_parts(self.lines.as_ptr() as *const [u64; 2], self.n) }
+    }
+}
+
 struct Wk {
-    bk: Vec<Vec<[u64; 2]>>,
+    /// Event records per index bucket. UnsafeCell: the dedup worker that owns bucket b frees
+    /// its vectors as soon as the bucket is done (each bucket has exactly one owner).
+    bk: Vec<std::cell::UnsafeCell<Wc4>>,
     oddev: Vec<(u64, [u64; 2])>,
     oddu: Vec<u64>,
     fb: Fb,
@@ -216,6 +269,8 @@ struct Wk {
     /// 1: ingest not whole seconds or before window_start - 1 day; 2: odd-user list overflow
     fail: u8,
 }
+// Safety: `bk` cells are only mutated by the single dedup worker that claimed that bucket index.
+unsafe impl Sync for Wk {}
 
 struct Raw<T>(*mut T);
 unsafe impl<T> Send for Raw<T> {}
@@ -596,6 +651,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
     }
     let est_rows = ev_bytes / 80;
     let bcap = (est_rows as f64 * 1.08 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
+    // clicks per (worker, person bucket), generously: ~25 events per person, lines >= 36 bytes
+    let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
+    let ccap = ck_bytes / 36 / ((est_rows / 25 >> CB) + 1) / nthreads * 2 + 64;
     let next = AtomicUsize::new(0);
     // SS_E2ABL=1..4 (diagnostic): stop the event row body after scan / +timestamps / +ID decode /
     // +all fields (no record write), print the parse time and exit.
@@ -604,7 +662,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         .into_par_iter()
         .map(|t| {
             let mut w = Wk {
-                bk: (0..nbk).map(|_| Vec::new()).collect(),
+                bk: (0..nbk).map(|_| std::cell::UnsafeCell::new(Wc4::new())).collect(),
                 oddev: Vec::new(),
                 oddu: Vec::new(),
                 fb: Fb::new(),
@@ -676,6 +734,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                     let cb = (p >> CB) as usize;
                                     if cb >= w.cks.len() {
                                         w.cks.resize_with(cb + 1, Vec::new);
+                                    }
+                                    if w.cks[cb].capacity() == 0 {
+                                        w.cks[cb].reserve(ccap); // untouched capacity costs nothing
                                     }
                                     w.cks[cb].push((p, lo | (a as u64) << 28, ckey));
                                 }
@@ -768,11 +829,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                             w.maxp = w.maxp.wrapping_add((w0 ^ w1 ^ idx) as u32 & 1);
                                             return;
                                         }
-                                        let v = &mut w.bk[(idx >> BSH) as usize];
-                                        if v.capacity() == 0 {
-                                            v.reserve(bcap);
-                                        }
-                                        v.push([w0, w1 | (idx & (BSZ as u64 - 1))]);
+                                        w.bk[(idx >> BSH) as usize].get_mut().push([w0, w1 | (idx & (BSZ as u64 - 1))], bcap / 4 + 1);
                                         return;
                                     }
                                 }
@@ -784,6 +841,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     }
                 }
             }
+            for b in w.bk.iter_mut() {
+                b.get_mut().finish();
+            }
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_sfence()
+            };
             w
         })
         .collect();
@@ -804,6 +868,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     let np = wks.iter().map(|w| w.maxp).max().unwrap_or(0) as usize + 1;
     lap(&format!("parsed ({} persons)", np));
+    // Drop the input files' page-table entries on a spare thread now (as fast.rs does), instead
+    // of leaving them to the serial teardown at exit. Read-only file mappings: odd IDs that still
+    // point into a file fault back in from the page cache.
+    if std::env::var("SS_EARLYUNMAP").as_deref() != Ok("0") {
+        std::thread::spawn(move || {
+            for m in ev_maps.iter().chain(lk_maps.iter()).chain(ck_maps.iter()) {
+                unsafe { libc::madvise(m.as_ptr() as *mut libc::c_void, m.len(), libc::MADV_DONTNEED) };
+            }
+        });
+    }
 
     // ---------------- identity
     let mut cplx = vec![0u64; np / 64 + 1];
@@ -905,13 +979,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 if b >= nbk {
                     break;
                 }
-                let n: usize = wks.iter().map(|w| w.bk[b].len()).sum();
+                // Safety: bucket b is claimed by this worker only.
+                let n: usize = wks.iter().map(|w| unsafe { (*w.bk[b].get()).n }).sum();
                 if n == 0 {
                     continue;
                 }
                 cur += 1;
                 for w in &wks {
-                    for r in &w.bk[b] {
+                    for r in unsafe { (*w.bk[b].get()).as_slice() } {
                         let s = (r[1] & (BSZ as u64 - 1)) as usize;
                         if gen[s] != cur || ing_of(r[1]) < ing_of(win[s][1]) {
                             win[s] = *r;
@@ -927,6 +1002,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
                 count_runs(&simple, &ecnt);
                 outs.push(simple);
+                // the bucket's records are done: free them now so later allocations reuse the pages
+                for w in &wks {
+                    unsafe { *w.bk[b].get() = Wc4::new() };
+                }
             }
             (outs, cx)
         })
@@ -1147,6 +1226,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
     }
     groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.2)); // biggest first
+    lap(&format!("whole-run persons ({} split persons, {} split events)", groups.len(), groups.iter().map(|g| g.2 as u64).sum::<u64>()));
     let nextg = AtomicUsize::new(0);
     let more: Vec<Part> = (0..nthreads)
         .into_par_iter()
