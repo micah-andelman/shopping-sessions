@@ -324,6 +324,7 @@ unsafe impl<T> Send for Raw<T> {}
 unsafe impl<T> Sync for Raw<T> {}
 
 mod fast;
+mod scan;
 
 fn main() {
     if let Some(n) = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()) {

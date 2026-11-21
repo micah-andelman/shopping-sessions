@@ -9,6 +9,7 @@
 
 use super::*;
 use std::collections::HashMap;
+use super::scan::scan;
 
 const NB: usize = 256;
 const FB: u64 = 1 << 63;
@@ -245,6 +246,38 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // Event chunk groups, computed up front so the prefetcher can read ahead in parse order.
     let ev_chunks: &'static [Ch] = Vec::leak(chunks(ev_maps));
     let ev_groups: Vec<&'static [Ch]> = split_groups(ev_chunks, std::env::var("SS_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(nthreads));
+    if std::env::var("SS_PARSEBENCH").is_ok() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let sink = AtomicU64::new(0);
+        for stage in 0..6 {
+            let t = std::time::Instant::now();
+            ev_chunks.par_iter().for_each(|&(mi, s, e)| {
+                let d: &'static [u8] = &ev_maps[mi][s..e];
+                let mut acc = 0u64;
+                if stage == 0 {
+                    let mut i = 0;
+                    while i < d.len() { acc += d[i] as u64; i += 4096; }
+                } else {
+                    let mut fb = Fb::new();
+                    for_lines(d, |l| {
+                        if stage == 1 { acc += l.len() as u64; return; }
+                        let f = match fields::<7>(l) { Some(f) => f, None => return };
+                        if stage == 2 { acc += f[0].map_or(0, |x| x.len()) as u64; return; }
+                        let a = parse_ts(f[2]); let b = parse_ts(f[3]);
+                        acc = acc.wrapping_add(a as u64 ^ b as u64);
+                        if stage == 3 { return; }
+                        acc = acc.wrapping_add(key_of(f[0].unwrap_or(b"x"), &mut fb) ^ key_of(f[1].unwrap_or(b"x"), &mut fb));
+                        if stage == 4 { return; }
+                        acc += prod.get(f[5].unwrap_or(b"x")).unwrap_or(0) as u64;
+                    });
+                }
+                sink.fetch_add(acc, Relaxed);
+            });
+            eprintln!("stage {} {:.3}s", stage, t.elapsed().as_secs_f64());
+        }
+        eprintln!("{}", sink.load(Relaxed));
+        std::process::exit(0);
+    }
     // Cold-cache I/O overlap: background threads ask the kernel for every input window
     // (links, then events interleaved across parse groups, then clicks) so reads run ahead of parsing.
     if std::env::var("SS_NOPREFETCH").is_err() {
@@ -293,8 +326,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let d: &'static [u8] = &lk_maps[mi][s..e];
                 let mut v = Vec::new();
                 let mut fb = Fb::new();
-                for_lines(d, |l| {
-                    if let Some([Some(a), Some(b)]) = fields::<2>(l) {
+                scan::<2>(d, |f| {
+                    if let [Some(a), Some(b)] = *f {
                         v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
                     }
                 });
@@ -358,11 +391,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut fb = Fb::new();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
-                    for_lines(d, |l| {
-                        let f = match fields::<7>(l) {
-                            Some(f) => f,
-                            None => return,
-                        };
+                    scan::<7>(d, |f| {
                         let eid = match f[0] {
                             Some(x) => x,
                             None => return,
@@ -452,11 +481,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let d: &'static [u8] = &ck_maps[mi][s..e];
                 let mut v = Vec::with_capacity(d.len() / 45 + 16);
                 let mut fb = Fb::new();
-                for_lines(d, |l| {
-                    let f = match fields::<4>(l) {
-                        Some(f) => f,
-                        None => return,
-                    };
+                scan::<4>(d, |f| {
                     let (cid, uid) = match (f[0], f[1]) {
                         (Some(c), Some(u)) => (c, u),
                         _ => return,
