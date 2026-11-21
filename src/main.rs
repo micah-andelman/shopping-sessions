@@ -53,6 +53,10 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
         Err(_) => Vec::new(),
     };
     v.sort();
+    // test knob: process files in reverse order (results must not depend on file order)
+    if std::env::var("SS_REVFILES").is_ok() {
+        v.reverse();
+    }
     v
 }
 
