@@ -300,6 +300,24 @@ pub fn run(data: &Path, out: &Path) -> bool {
             eprintln!("{:>8.3}s  {}", t0.elapsed().as_secs_f64(), what)
         }
     };
+    // SS_TIMELINE=1 (diagnostic): every 5 ms print how many threads were busy, from getrusage CPU time.
+    if std::env::var("SS_TIMELINE").is_ok() {
+        std::thread::spawn(move || {
+            let cpu = || unsafe {
+                let mut r: libc::rusage = std::mem::zeroed();
+                libc::getrusage(libc::RUSAGE_SELF, &mut r);
+                (r.ru_utime.tv_sec + r.ru_stime.tv_sec) as f64 + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 * 1e-6
+            };
+            let (mut pw, mut pc) = (t0.elapsed().as_secs_f64(), cpu());
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let (w, c) = (t0.elapsed().as_secs_f64(), cpu());
+                eprintln!("{:>8.3}s  busy {:.1}", w, (c - pc) / (w - pw));
+                pw = w;
+                pc = c;
+            }
+        });
+    }
 
     let man = match std::fs::read_to_string(data.join("manifest.json")) {
         Ok(m) => m,
@@ -872,10 +890,15 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
 
     // per person partition: gather, sort in cache, walk persons
-    let ngr = (nthreads * 4).min(NP);
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..ngr)
+    // Partitions are claimed one at a time, largest first, by one worker per thread, so the
+    // partitions holding whale persons start early instead of finishing last.
+    let mut order: Vec<usize> = (0..NP).collect();
+    let psize: Vec<usize> = (0..NP).map(|p| eparts.iter().map(|g| g[p].len()).sum()).collect();
+    order.sort_by_key(|&p| std::cmp::Reverse(psize[p]));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..nthreads)
         .into_par_iter()
-        .map(|gi| {
+        .map(|_| {
             let mut rows: Vec<UserRow> = Vec::new();
             let mut acc = Acc {
                 camp: vec![[0i64; 4]; ncamp * ndays],
@@ -890,7 +913,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let mut ids: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::new();
             let mut keys: Vec<u64> = Vec::new();
             let use_radix = std::env::var("SS_NORADIX").is_err();
-            for p in (gi * NP / ngr)..((gi + 1) * NP / ngr) {
+            loop {
+                let oi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if oi >= NP {
+                    break;
+                }
+                let p = order[oi];
                 ek.clear();
                 ck.clear();
                 if !use_radix {
