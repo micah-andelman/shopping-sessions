@@ -8,6 +8,8 @@ memmap2 = "0.9"
 rayon = "1.10"
 memchr = "2.7"
 foldhash = "0.1"
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
+mimalloc = { version = "0.1", default-features = false }
 arrow-array = "54.2"
 arrow-schema = "54.2"
 parquet = { version = "54.2", default-features = false, features = ["arrow"] }

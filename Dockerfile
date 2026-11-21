@@ -2,6 +2,7 @@
 FROM rust:1.85-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
 COPY src/ src/
 RUN cargo build --release --locked && strip target/release/sessions
 
