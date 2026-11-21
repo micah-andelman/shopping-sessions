@@ -1008,6 +1008,17 @@ pub fn run(data: &Path, out: &Path) -> bool {
         None => return false,
     };
     lap(&format!("links ({} ids) and events parsed", ltab.n));
+    // The event and link files are fully parsed. Drop their page-table entries now, on a spare
+    // thread, instead of leaving ~1.6 GB of 4 KB file mappings to be torn down serially at exit
+    // (~18 ms at 20M, in the measured wall time). MADV_DONTNEED on a read-only file mapping only
+    // unmaps: fallback IDs that still point into a file fault back in from the page cache.
+    if std::env::var("SS_NOEARLYUNMAP").is_err() {
+        std::thread::spawn(move || {
+            for m in ev_maps.iter().chain(lk_maps.iter()) {
+                unsafe { libc::madvise(m.as_ptr() as *mut libc::c_void, m.len(), libc::MADV_DONTNEED) };
+            }
+        });
+    }
 
     // Person partitions: survivors and clicks are scattered by hash(person key) so each
     // partition is sorted on its own, in cache, instead of one global sort.
