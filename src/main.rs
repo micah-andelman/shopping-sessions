@@ -173,6 +173,121 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+// ---- fast paths: same results as parse_ts / parse_price (differentially tested in tests below);
+// anything unusual falls back to the reference functions.
+
+/// SWAR: true iff every byte selected by `m` is an ASCII digit and every other byte equals `sep`.
+#[inline(always)]
+fn swar_ok(w: u64, m: u64, sep: u64) -> bool {
+    let x = w ^ 0x3030_3030_3030_3030;
+    if (w & !m) != sep || (x & m & 0xF0F0_F0F0_F0F0_F0F0) != 0 {
+        return false;
+    }
+    ((x & m).wrapping_add(0x0606_0606_0606_0606 & m) & 0x1010_1010_1010_1010 & m) == 0
+}
+
+/// Single pass over up to 18 digits (no separate digits()/leading-zero scans).
+#[inline(always)]
+fn digits_u64(v: &[u8]) -> Option<i64> {
+    let mut x: i64 = 0;
+    let mut bad = 0u8;
+    for &c in v {
+        let d = c.wrapping_sub(b'0');
+        bad |= (d > 9) as u8;
+        x = x.wrapping_mul(10).wrapping_add(d as i64);
+    }
+    if bad == 0 { Some(x) } else { None }
+}
+
+/// Epoch ms, or BAD (same contract as parse_ts).
+#[inline]
+fn parse_ts_fast(v: Option<&[u8]>) -> i64 {
+    let v = match v {
+        Some(v) => v,
+        None => return BAD,
+    };
+    let n = v.len();
+    if n == 20 || n == 25 {
+        // "YYYY-MM-" "DDTHH:MM" ":SS" then 'Z' or "+hh:mm"/"-hh:mm"
+        let a = u64::from_le_bytes(v[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(v[8..16].try_into().unwrap());
+        const MA: u64 = 0x00FF_FF00_FFFF_FFFF; // digits at 0-3, 5-6
+        const SA: u64 = 0x2D00_002D_0000_0000; // '-' at 4 and 7
+        const MB: u64 = 0xFFFF_00FF_FF00_FFFF; // digits at 0-1, 3-4, 6-7
+        const SB: u64 = 0x0000_3A00_0054_0000; // 'T' at 2, ':' at 5
+        if !swar_ok(a, MA, SA) || !swar_ok(b, MB, SB) || v[16] != b':' {
+            return parse_ts(Some(v));
+        }
+        let (s1, s2) = (v[17].wrapping_sub(b'0'), v[18].wrapping_sub(b'0'));
+        if s1 > 9 || s2 > 9 {
+            return BAD;
+        }
+        let ad = a ^ 0x3030_3030_3030_3030;
+        let bd = b ^ 0x3030_3030_3030_3030;
+        let by = |w: u64, i: u32| ((w >> (8 * i)) & 0xFF) as i64;
+        let y = by(ad, 0) * 1000 + by(ad, 1) * 100 + by(ad, 2) * 10 + by(ad, 3);
+        let mo = by(ad, 5) * 10 + by(ad, 6);
+        let d = by(bd, 0) * 10 + by(bd, 1);
+        let h = by(bd, 3) * 10 + by(bd, 4);
+        let mi = by(bd, 6) * 10 + by(bd, 7);
+        let s = s1 as i64 * 10 + s2 as i64;
+        let off = if n == 20 {
+            if v[19] != b'Z' {
+                return BAD;
+            }
+            0
+        } else {
+            let sign = v[19];
+            if (sign != b'+' && sign != b'-') || v[22] != b':' {
+                return BAD;
+            }
+            let (o1, o2, o3, o4) =
+                (v[20].wrapping_sub(b'0'), v[21].wrapping_sub(b'0'), v[23].wrapping_sub(b'0'), v[24].wrapping_sub(b'0'));
+            if o1 > 9 || o2 > 9 || o3 > 9 || o4 > 9 {
+                return BAD;
+            }
+            let (oh, om) = (o1 as i64 * 10 + o2 as i64, o3 as i64 * 10 + o4 as i64);
+            if oh > 23 || om > 59 {
+                return BAD;
+            }
+            let o = (oh * 60 + om) * 60_000;
+            if sign == b'+' { o } else { -o }
+        };
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+            return BAD;
+        }
+        let md = if mo == 2 {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 }
+        } else {
+            [31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize]
+        };
+        if d > md {
+            return BAD;
+        }
+        return (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s) * 1000 - off;
+    }
+    if n >= 1 && n <= 18 {
+        return match digits_u64(v) {
+            Some(x) => x,
+            None => parse_ts(Some(v)),
+        };
+    }
+    parse_ts(Some(v))
+}
+
+/// Same contract as parse_price.
+#[inline]
+fn parse_price_fast(v: Option<&[u8]>) -> i64 {
+    match v {
+        Some(v) if !v.is_empty() && v.len() <= 8 => match digits_u64(v) {
+            Some(x) if (1..=10_000_000).contains(&x) => x,
+            Some(_) => -1,
+            None => -1,
+        },
+        _ => parse_price(v),
+    }
+}
+
 /// Epoch ms, or BAD. Window is checked by the caller.
 fn parse_ts(v: Option<&[u8]>) -> i64 {
     let v = match v {
@@ -1001,4 +1116,58 @@ fn take_top(catsum: &mut [i64], touched: &mut Vec<u16>) -> Option<u16> {
     }
     touched.clear();
     best
+}
+
+#[cfg(test)]
+mod parse_fast_tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn ts_and_price_match_reference() {
+        let mut fixed: Vec<Vec<u8>> = [
+            "2028-02-29T12:00:00Z", "2027-02-29T12:00:00Z", "2100-02-29T00:00:00Z", "2000-02-29T00:00:00Z",
+            "2026-11-20T23:59:59Z", "2026-11-20T24:00:00Z", "2026-11-20T23:60:00Z", "2026-11-20T23:59:60Z",
+            "2026-13-01T00:00:00Z", "2026-00-01T00:00:00Z", "2026-04-31T00:00:00Z", "2026-04-00T00:00:00Z",
+            "2026-11-20T10:00:00+12:00", "2026-11-20T10:00:00-10:00", "2026-11-20T10:00:00+24:00",
+            "2026-11-20T10:00:00+05:60", "2026-11-20T10:00:00*05:00", "2026-11-20T10:00:00+0500x",
+            "2026-11-20 10:00:00Z", "2026/11/20T10:00:00Z", "2026-11-20T10:00:00z", "2026-11-20T10:00:0aZ",
+            "0000-01-01T00:00:00Z", "9999-12-31T23:59:59Z", "1789000000000", "0001789000000000", "0",
+            "000000000000000000", "999999999999999999", "1234567890123456789", "00000000000001700000",
+            "12a", "", " 1", "1 ", "-1", "+1", "1.5", "17890000000000000000000",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        let alphabet = b"0123456789-:TZ+ .x\x00\xff/";
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..400_000 {
+            let base = fixed[(rng(&mut s) % 39) as usize].clone();
+            let mut v = base;
+            for _ in 0..(rng(&mut s) % 3) {
+                if v.is_empty() {
+                    break;
+                }
+                let i = (rng(&mut s) as usize) % v.len();
+                v[i] = alphabet[(rng(&mut s) as usize) % alphabet.len()];
+            }
+            fixed.push(v);
+        }
+        for _ in 0..200_000 {
+            let n = (rng(&mut s) % 27) as usize;
+            fixed.push((0..n).map(|_| alphabet[(rng(&mut s) as usize) % alphabet.len()]).collect());
+        }
+        for v in &fixed {
+            assert_eq!(parse_ts_fast(Some(v)), parse_ts(Some(v)), "ts {:?}", String::from_utf8_lossy(v));
+            assert_eq!(parse_price_fast(Some(v)), parse_price(Some(v)), "price {:?}", String::from_utf8_lossy(v));
+        }
+        assert_eq!(parse_ts_fast(None), parse_ts(None));
+        assert_eq!(parse_price_fast(None), parse_price(None));
+    }
 }

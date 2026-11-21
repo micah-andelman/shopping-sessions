@@ -543,9 +543,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             None => return,
                         };
                         let ekey = key_of(eid, &mut fb);
-                        let ing = parse_ts(f[3]);
+                        let ing = parse_ts_fast(f[3]);
                         let ing = if ing == BAD { i64::MAX } else { ing };
-                        let ts = parse_ts(f[2]);
+                        let ts = parse_ts_fast(f[2]);
                         let typ = match f[4] {
                             Some(b"view") => 0u8,
                             Some(b"cart") => 1,
@@ -555,7 +555,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         let mut ok = typ != 3 && f[1].is_some() && f[5].is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
                         let mut price = 0u64;
                         if ok && typ == 2 {
-                            let p = parse_price(f[6]);
+                            let p = parse_price_fast(f[6]);
                             if p < 0 { ok = false } else { price = p as u64 }
                         }
                         let (ukey, lo) = if ok {
@@ -675,7 +675,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             (Some(c), Some(u)) => (c, u),
                             _ => return,
                         };
-                        let ts = parse_ts(f[3]);
+                        let ts = parse_ts_fast(f[3]);
                         if ts == BAD || ts < cws || ts >= we {
                             return;
                         }
