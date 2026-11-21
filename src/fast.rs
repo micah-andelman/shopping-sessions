@@ -329,7 +329,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // Event chunk groups, computed up front so the prefetcher can read ahead in parse order.
     let ev_chunks: &'static [Ch] = Vec::leak(chunks(ev_maps));
-    let ev_groups: Vec<&'static [Ch]> = split_groups(ev_chunks, std::env::var("SS_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(nthreads));
+    let ev_groups: Vec<&'static [Ch]> = split_groups(ev_chunks, std::env::var("SS_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(nthreads * 8));
     if std::env::var("SS_PARSEBENCH").is_ok() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let sink = AtomicU64::new(0);
@@ -465,22 +465,26 @@ pub fn run(data: &Path, out: &Path) -> bool {
     }
 
     // ---------------- links -> table: id key -> person key (root = byte-wise smallest id)
-    let link_job = || -> Option<(LinkTab, Fb)> {
-        let lk_chunks = chunks(lk_maps);
-        let parts: Vec<(Vec<(u64, u64)>, Fb)> = lk_chunks
-            .par_iter()
-            .map(|&(mi, s, e)| {
-                let d: &'static [u8] = &lk_maps[mi][s..e];
-                let mut v = Vec::new();
-                let mut fb = Fb::new();
-                scan::<2>(d, |f| {
-                    if let [Some(a), Some(b)] = *f {
-                        v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
-                    }
-                });
-                (v, fb)
-            })
+    // Links are small: parse them first on all threads, so the serial tail below (sort, index,
+    // union-find, table) runs on one thread WHILE the events parse on the others, instead of
+// the link chunks queueing behind the big event groups and the tail running alone after.
+    let lk_chunks = chunks(lk_maps);
+    let parts: Vec<(Vec<(u64, u64)>, Fb)> = lk_chunks
+        .par_iter()
+        .map(|&(mi, s, e)| {
+            let d: &'static [u8] = &lk_maps[mi][s..e];
+            let mut v = Vec::new();
+            let mut fb = Fb::new();
+            scan::<2>(d, |f| {
+                if let [Some(a), Some(b)] = *f {
+                    v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
+                }
+            });
+            (v, fb)
+        })
             .collect();
+    if verbose { eprintln!("  link {} {:.3}s", "parsed", t0.elapsed().as_secs_f64()); }
+    let link_job = move || -> Option<(LinkTab, Fb)> {
         let fbm = merge_fb(parts.iter().map(|p| &p.1))?;
         let mut lids: Vec<u64> = Vec::with_capacity(parts.iter().map(|p| p.0.len() * 2).sum());
         for (v, _) in &parts {
@@ -494,10 +498,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
         if !fbm.is_empty() {
             lids.sort_by(|&a, &b| cmp_id(a, b, &fbm));
         }
+        if verbose { eprintln!("  link {} {:.3}s", "sorted", t0.elapsed().as_secs_f64()); }
         let mut idx: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::with_capacity(lids.len());
         for (i, &k) in lids.iter().enumerate() {
             idx.insert_unique(th(k), (k, i as u32), |e| th(e.0));
         }
+        if verbose { eprintln!("  link {} {:.3}s", "idx", t0.elapsed().as_secs_f64()); }
         let get = |k: u64| idx.find(th(k), |e| e.0 == k).unwrap().1;
         let mut parent: Vec<u32> = (0..lids.len() as u32).collect();
         fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -517,18 +523,20 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
             }
         }
+        if verbose { eprintln!("  link {} {:.3}s", "uf", t0.elapsed().as_secs_f64()); }
         let mut table = LinkTab::new(lids.len());
         for i in 0..lids.len() as u32 {
             let r = find(&mut parent, i);
             table.insert(lids[i as usize], lids[r as usize]);
         }
+        if verbose { eprintln!("  link {} {:.3}s", "table", t0.elapsed().as_secs_f64()); }
         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
         Some((table, fb))
     };
 
     // ---------------- events: parse every copy, scatter by event_id bucket
     let ev_job = || -> Vec<(Vec<Vec<Ev>>, Fb)> {
-        ev_groups
+        let r: Vec<(Vec<Vec<Ev>>, Fb)> = ev_groups
             .par_iter()
             .map(|grp| {
                 let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
@@ -571,7 +579,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
                 (bk, fb)
             })
-            .collect()
+            .collect();
+        if verbose { eprintln!("  events done {:.3}s", t0.elapsed().as_secs_f64()); }
+        r
     };
 
     let (links, evp) = rayon::join(link_job, ev_job);
