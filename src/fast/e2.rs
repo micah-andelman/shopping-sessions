@@ -318,6 +318,26 @@ impl<T> Clone for Raw<T> {
 }
 impl<T> Copy for Raw<T> {}
 
+/// read_small with borrowed fields: the file is read once into a leaked buffer and rows are
+/// (first, second) slices of it (same lines and fields as read_small, no per-row allocations).
+fn read_pairs(path: &Path) -> Vec<(&'static [u8], &'static [u8])> {
+    let data: &'static [u8] = match std::fs::read(path) {
+        Ok(d) => Vec::leak(d),
+        Err(_) => return Vec::new(),
+    };
+    let body = match memchr::memchr(b'\n', data) {
+        Some(p) => &data[p + 1..],
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for_lines(body, |l| {
+        if let Some([Some(a), Some(b)]) = fields::<2>(l) {
+            out.push((a, b));
+        }
+    });
+    out
+}
+
 struct UserOut {
     c: [super::pq::Col; 6],
     n: usize,
@@ -551,34 +571,56 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
     let ibase = ws - DAY; // ingest seconds are stored relative to this, 21 bits
 
-    let products = read_small(&data.join("products.csv"));
-    let campaigns = read_small(&data.join("campaigns.csv"));
-    let mut cats: Vec<Vec<u8>> = products.iter().map(|r| r[1].clone()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
-    if cats.len() > 32 {
-        return decline("more than 32 categories");
-    }
-    let cat_of = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u32;
-    let unknown = cat_of(b"unknown") as u64;
-    let mut prod = Dict::new(products.len() * 2);
-    for r in &products {
-        prod.insert(&r[0], cat_of(&r[1]));
-    }
-    let mut camp_map = Dict::new(campaigns.len() * 2);
-    let mut camp_names: Vec<(&[u8], &[u8])> = Vec::new();
-    for r in &campaigns {
-        if camp_map.get(&r[0]).is_none() {
-            camp_map.insert(&r[0], camp_names.len() as u32);
-            camp_names.push((&r[0], &r[1]));
+    // Small tables (products, campaigns) are built beside key recovery, after the maps are open.
+    let small_fn = || -> Result<_, &'static str> {
+        let products = read_pairs(&data.join("products.csv"));
+        let campaigns = read_pairs(&data.join("campaigns.csv"));
+        // distinct categories by a short linear scan (at most 33 before declining) instead of
+        // copying and sorting every product's category; then the same sorted order as before
+        let mut raw: Vec<&'static [u8]> = Vec::new();
+        let mut pidx: Vec<u8> = Vec::with_capacity(products.len());
+        for &(_, c) in &products {
+            let i = match raw.iter().position(|&x| x == c) {
+                Some(i) => i,
+                None => {
+                    if raw.len() >= 33 {
+                        return Err("more than 32 categories");
+                    }
+                    raw.push(c);
+                    raw.len() - 1
+                }
+            };
+            pidx.push(i as u8);
         }
-    }
-    let organic = camp_names.len() as u32;
-    if organic as u64 >= 1 << 28 {
-        return decline("campaign count");
-    }
-    let camp_tab = PackTab::new(camp_names.iter().enumerate().map(|(i, c)| (c.0, i as u32)));
+        let mut cats: Vec<Vec<u8>> = raw.iter().map(|c| c.to_vec()).collect();
+        cats.push(b"unknown".to_vec());
+        cats.sort();
+        cats.dedup();
+        if cats.len() > 32 {
+            return Err("more than 32 categories");
+        }
+        let cat_of = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u32;
+        let rank: Vec<u32> = raw.iter().map(|c| cat_of(c)).collect();
+        let unknown = cat_of(b"unknown") as u64;
+        let mut prod = Dict::new(products.len() * 2);
+        for (r, &i) in products.iter().zip(&pidx) {
+            prod.insert(r.0, rank[i as usize]);
+        }
+        let mut camp_map = Dict::new(campaigns.len() * 2);
+        let mut camp_names: Vec<(&'static [u8], &'static [u8])> = Vec::new();
+        for &(a, b) in &campaigns {
+            if camp_map.get(a).is_none() {
+                camp_map.insert(a, camp_names.len() as u32);
+                camp_names.push((a, b));
+            }
+        }
+        let organic = camp_names.len() as u32;
+        if organic as u64 >= 1 << 28 {
+            return Err("campaign count");
+        }
+        let camp_tab = PackTab::new(camp_names.iter().enumerate().map(|(i, c)| (c.0, i as u32)));
+        Ok((cats, unknown, prod, camp_map, camp_names, organic, camp_tab))
+    };
 
     let (ev_maps, (ck_maps, lk_maps)): (Vec<Mmap>, (Vec<Mmap>, Vec<Mmap>)) = rayon::join(
         || open_all(&list_csv(&data.join("events"))),
@@ -598,7 +640,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     lap("opened");
 
     // ---------------- keys from a sample of event rows (the largest file's first lines)
-    let (ku, ke) = {
+    let keys_fn = || -> Result<(u64, u64), &'static str> {
         let mut big: Option<&'static [u8]> = None;
         for m in ev_maps.iter() {
             if big.map_or(true, |b| m.len() > b.len()) {
@@ -607,7 +649,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
         let d = match big {
             Some(d) => d,
-            None => return decline("no event files"),
+            None => return Err("no event files"),
         };
         let start = memchr::memchr(b'\n', d).map_or(d.len(), |p| p + 1);
         let mut end = (start + (1 << 20)).min(d.len());
@@ -628,7 +670,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         us.sort_unstable();
         us.dedup();
         if us.len() < 24 || rows.len() < 24 {
-            return decline("too few canonical sample ids");
+            return Err("too few canonical sample ids");
         }
         // claude-45's genid recovery first (frequency anchors, absolute bounds), then ours
         let (geb, gpb) = super::super::genid::bounds(ev_bytes as u64);
@@ -640,7 +682,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let usample: Vec<u64> = us.iter().step_by(step).take(48).copied().collect();
                 match recover_user_key(&usample, pb) {
                     Some(k) => k,
-                    None => return decline("user key not found"),
+                    None => return Err("user key not found"),
                 }
             }
         };
@@ -653,18 +695,27 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }).collect();
                 withp.sort_unstable();
                 if withp.is_empty() {
-                    return decline("event key not found");
+                    return Err("event key not found");
                 }
                 let esample: Vec<u64> = rows.iter().step_by((rows.len() / 48).max(1)).take(48).map(|r| r.0).collect();
                 let (p0, w0) = withp[0];
                 let lim = if p0 == 0 { (ebound / 40 + 4096).min(ebound) } else { ebound };
                 match recover_event_key(&esample, w0, lim, ebound) {
                     Some(k) => k,
-                    None => return decline("event key not found"),
+                    None => return Err("event key not found"),
                 }
             }
         };
-        (ku, ke)
+        Ok((ku, ke))
+    };
+    let (sm, kr) = rayon::join(small_fn, keys_fn);
+    let (cats, unknown, prod, camp_map, camp_names, organic, camp_tab) = match sm {
+        Ok(s) => s,
+        Err(why) => return decline(why),
+    };
+    let (ku, ke) = match kr {
+        Ok(k) => k,
+        Err(why) => return decline(why),
     };
     // Test knob: wrong keys send every ID down the exact odd paths (output must not change).
     let (ku, ke) = if std::env::var("SS_E2BADKEY").is_ok() { (ku ^ 0x5a5a_5a5a5a, ke ^ 0x3c3c_3c3c3c) } else { (ku, ke) };
