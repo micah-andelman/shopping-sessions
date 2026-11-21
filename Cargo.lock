@@ -700,6 +700,7 @@ dependencies = [
  "arrow-schema",
  "foldhash",
  "hashbrown",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

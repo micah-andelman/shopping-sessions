@@ -304,8 +304,27 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
         whole(ck_maps, &mut wins);
         let wins: &'static [(&'static Mmap, usize, usize)] = Vec::leak(wins);
-        let mode = std::env::var("SS_IO").unwrap_or_else(|_| "advise".into());
-        let lanes: usize = std::env::var("SS_IOT").ok().and_then(|v| v.parse().ok()).unwrap_or(if mode == "touch" { 16 } else { 4 });
+        let mut mode = std::env::var("SS_IO").unwrap_or_else(|_| "auto".into());
+        if mode == "auto" {
+            // Sample the first page of every window with mincore(): if the input is already in the
+            // page cache, prefetch threads only cost CPU; if it is cold, readers that populate
+            // windows ahead of the parsers win.
+            let (mut hit, mut n) = (0usize, 0usize);
+            for &(m, s, _) in wins.iter() {
+                let mut v = [0u8; 1];
+                let p = unsafe { m.as_ptr().add(s & !4095) } as *mut libc::c_void;
+                if unsafe { libc::mincore(p, 1, v.as_mut_ptr()) } == 0 {
+                    n += 1;
+                    hit += (v[0] & 1) as usize;
+                }
+            }
+            let frac = if n == 0 { 1.0 } else { hit as f64 / n as f64 };
+            mode = if frac >= 0.8 { "none".into() } else { "populate".into() };
+            if verbose {
+                eprintln!("input resident {:.0}% -> io mode {}", frac * 100.0, mode);
+            }
+        }
+        let lanes: usize = std::env::var("SS_IOT").ok().and_then(|v| v.parse().ok()).unwrap_or(if mode == "advise" { 4 } else if mode == "touch" { 16 } else { 8 });
         if mode == "populate" {
             // MADV_POPULATE_READ (Linux 5.14+): read AND map each window, so parsers never fault.
             // Falls back to WILLNEED where unsupported.
