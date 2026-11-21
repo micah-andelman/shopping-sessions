@@ -150,9 +150,12 @@ fn def_levels(defs: &[bool], out: &mut Vec<u8>) {
 
 /// Write `cols` (all with `rows` values) as one Parquet file.
 pub fn write(path: &Path, cols: &[Col], rows: usize) -> std::io::Result<()> {
-    let mut f: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.buf.len() + c.defs.len() / 8 + 64).sum::<usize>() + 4096);
-    f.extend_from_slice(b"PAR1");
-    // (offset of page header, total chunk bytes, values)
+    // The file is written piecewise: magic, then per column a small head (page header and
+    // definition levels) followed by the column's value buffer as it is, then the footer.
+    // The value buffers are never copied into one big buffer first.
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
+    let mut pos = 4i64; // after "PAR1"
+    // (offset of page header, total chunk bytes)
     let mut chunks: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
     if rows > 0 {
         for c in cols {
@@ -172,11 +175,12 @@ pub fn write(path: &Path, cols: &[Col], rows: usize) -> std::io::Result<()> {
             h.i32(4, 3); // RLE repetition levels
             h.end();
             h.b.push(0);
-            let off = f.len() as i64;
-            f.extend_from_slice(&h.b);
-            f.extend_from_slice(&page);
-            f.extend_from_slice(&c.buf);
-            chunks.push((off, f.len() as i64 - off));
+            let mut head = h.b;
+            head.extend_from_slice(&page);
+            let len = (head.len() + c.buf.len()) as i64;
+            chunks.push((pos, len));
+            pos += len;
+            heads.push(head);
         }
     }
     // FileMetaData
@@ -250,8 +254,18 @@ pub fn write(path: &Path, cols: &[Col], rows: usize) -> std::io::Result<()> {
     }
     m.bin(6, b"shopping-sessions");
     m.b.push(0);
-    f.extend_from_slice(&m.b);
-    f.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
-    f.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&f)
+    let mut foot = m.b;
+    let mlen = foot.len() as u32;
+    foot.extend_from_slice(&mlen.to_le_bytes());
+    foot.extend_from_slice(b"PAR1");
+    let mut f = std::fs::File::create(path)?;
+    let mut first: Vec<u8> = b"PAR1".to_vec();
+    for (c, head) in cols.iter().zip(&heads) {
+        first.extend_from_slice(head);
+        f.write_all(&first)?;
+        first.clear();
+        f.write_all(&c.buf)?;
+    }
+    first.extend_from_slice(&foot);
+    f.write_all(&first)
 }

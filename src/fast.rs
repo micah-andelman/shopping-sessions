@@ -1317,6 +1317,46 @@ pub fn run(data: &Path, out: &Path) -> bool {
         revenue: i64,
         top: Option<u16>,
     }
+    /// Output rows of one worker, encoded straight into the six Parquet column buffers of its
+    /// user_daily file (the 48-byte rows are never stored). `push` is the only way in.
+    struct UserOut<'a> {
+        c: [super::pq::Col; 6],
+        n: usize,
+        fbm: &'a HashMap<u64, &'static [u8]>,
+        cats: &'a [Vec<u8>],
+    }
+    impl<'a> UserOut<'a> {
+        fn new(fbm: &'a HashMap<u64, &'static [u8]>, cats: &'a [Vec<u8>], est_rows: usize) -> Self {
+            use super::pq::{Col, Kind};
+            UserOut {
+                c: [
+                    Col::new("user_id", Kind::Str, est_rows),
+                    Col::new("day", Kind::Date, est_rows),
+                    Col::new("sessions", Kind::I32, est_rows),
+                    Col::new("events", Kind::I32, est_rows),
+                    Col::new("revenue_cents", Kind::I64, est_rows),
+                    Col::new("top_category", Kind::OptStr, est_rows),
+                ],
+                n: 0,
+                fbm,
+                cats,
+            }
+        }
+        #[inline]
+        fn push(&mut self, r: UserRow) {
+            let fbm = self.fbm;
+            self.c[0].bytes_with(|o| id_into(r.key, fbm, o));
+            self.c[1].i32(r.day as i32);
+            self.c[2].i32(r.sessions as i32);
+            self.c[3].i32(r.events as i32);
+            self.c[4].i64(r.revenue);
+            match r.top {
+                Some(t) => self.c[5].bytes(&self.cats[t as usize]),
+                None => self.c[5].null(),
+            }
+            self.n += 1;
+        }
+    }
     struct Acc {
         camp: Vec<[i64; 4]>,
         cnt: Vec<u32>,
@@ -1324,7 +1364,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         catsum: Vec<i64>,
         touched: Vec<u16>,
     }
-    let do_person = |key: u64, evr: &[(u64, u64)], ckr: &[Ck], acc: &mut Acc, rows: &mut Vec<UserRow>| {
+    let do_person = |key: u64, evr: &[(u64, u64)], ckr: &[Ck], acc: &mut Acc, rows: &mut UserOut| {
         for &a in &acc.active {
             acc.cnt[a as usize] = 0;
         }
@@ -1429,10 +1469,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let psize: Vec<usize> = (0..NP).map(|p| eparts.iter().map(|g| g[p].len()).sum()).collect();
     order.sort_by_key(|&p| std::cmp::Reverse(psize[p]));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..nthreads)
+    // Column buffers are sized for an even share of the survivors at one row per 6 events
+    // (20M: one per 8.7); they grow if a worker produces more.
+    let est_rows = psize.iter().sum::<usize>() / nthreads / 6 + 1024;
+    let results: Vec<(UserOut, Vec<[i64; 4]>)> = (0..nthreads)
         .into_par_iter()
         .map(|_| {
-            let mut rows: Vec<UserRow> = Vec::new();
+            let mut rows = UserOut::new(&fbm, &cats, est_rows);
             let mut acc = Acc {
                 camp: vec![[0i64; 4]; ncamp * ndays],
                 cnt: vec![0u32; ncamp],
@@ -1556,32 +1599,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let cd_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let nf = nthreads;
-    let per = results.len().div_ceil(nf).max(1);
-    let groups: Vec<&[(Vec<UserRow>, Vec<[i64; 4]>)]> = results.chunks(per).collect();
+    // One file per worker: its column buffers are already encoded (UserOut), so this only
+    // adds the page headers and footer and hands the buffers to the kernel.
     let write_users = || {
-        groups.par_iter().enumerate().for_each(|(pi, g)| {
-            let n: usize = g.iter().map(|(r, _)| r.len()).sum();
-            let mut c = [
-                Col::new("user_id", Kind::Str, n),
-                Col::new("day", Kind::Date, n),
-                Col::new("sessions", Kind::I32, n),
-                Col::new("events", Kind::I32, n),
-                Col::new("revenue_cents", Kind::I64, n),
-                Col::new("top_category", Kind::OptStr, n),
-            ];
-            for r in g.iter().flat_map(|(r, _)| r.iter()) {
-                c[0].bytes_with(|o| id_into(r.key, &fbm, o));
-                c[1].i32(r.day as i32);
-                c[2].i32(r.sessions as i32);
-                c[3].i32(r.events as i32);
-                c[4].i64(r.revenue);
-                match r.top {
-                    Some(t) => c[5].bytes(&cats[t as usize]),
-                    None => c[5].null(),
-                }
-            }
-            pq::write(&ud_dir.join(format!("part-{:04}.parquet", pi)), &c, n).unwrap();
+        results.par_iter().enumerate().for_each(|(pi, (rows, _))| {
+            pq::write(&ud_dir.join(format!("part-{:04}.parquet", pi)), &rows.c, rows.n).unwrap();
         });
     };
     let write_camps = || {
