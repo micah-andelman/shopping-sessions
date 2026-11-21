@@ -109,6 +109,24 @@ fn bytes_of(k: u64, fbm: &HashMap<u64, &'static [u8]>) -> Vec<u8> {
     s
 }
 
+/// Append the ID bytes of key `k` to `out` (same decoding as bytes_of, no allocation).
+#[inline]
+fn id_into(k: u64, fbm: &HashMap<u64, &'static [u8]>, out: &mut Vec<u8>) {
+    if k & FB != 0 {
+        out.extend_from_slice(fbm[&k]);
+        return;
+    }
+    let mut sh = 54i32;
+    while sh >= 0 {
+        let x = ((k >> sh) & 63) as usize;
+        if x == 0 {
+            break;
+        }
+        out.push(DEC[x]);
+        sh -= 6;
+    }
+}
+
 /// Byte-wise order of two keyed IDs.
 #[inline]
 fn cmp_id(a: u64, b: u64, fbm: &HashMap<u64, &'static [u8]>) -> std::cmp::Ordering {
@@ -871,96 +889,73 @@ pub fn run(data: &Path, out: &Path) -> bool {
     }
 
     // ---------------- write Parquet
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .set_data_page_size_limit(8 << 20)
-        .set_max_row_group_size(1 << 22)
-        .set_write_batch_size(1 << 16)
-        .build();
+    // Hand-written PLAIN Parquet (src/pq.rs): raw ID bytes straight into page buffers. Counts
+    // are INT32 (each is bounded by the total number of events, < 2^31); revenue stays INT64.
+    use super::pq::{self, Col, Kind};
     let ud_dir = out.join("user_daily");
     let cd_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let us = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-    let s = |b: &[u8]| -> String { String::from_utf8_lossy(b).into_owned() };
     let nf = nthreads;
     let per = results.len().div_ceil(nf).max(1);
     let groups: Vec<&[(Vec<UserRow>, Vec<[i64; 4]>)]> = results.chunks(per).collect();
     let write_users = || {
         groups.par_iter().enumerate().for_each(|(pi, g)| {
-            let all: Vec<&UserRow> = g.iter().flat_map(|(r, _)| r.iter()).collect();
-            let rows = || all.iter().copied();
-            let cols: Vec<ArrayRef> = vec![
-                Arc::new(StringArray::from_iter_values(rows().map(|r| s(&bytes_of(r.key, &fbm))))),
-                Arc::new(Date32Array::from_iter_values(rows().map(|r| r.day as i32))),
-                Arc::new(Int64Array::from_iter_values(rows().map(|r| r.sessions))),
-                Arc::new(Int64Array::from_iter_values(rows().map(|r| r.events))),
-                Arc::new(Int64Array::from_iter_values(rows().map(|r| r.revenue))),
-                Arc::new(StringArray::from_iter(rows().map(|r| r.top.map(|c| s(&cats[c as usize]))))),
+            let n: usize = g.iter().map(|(r, _)| r.len()).sum();
+            let mut c = [
+                Col::new("user_id", Kind::Str, n),
+                Col::new("day", Kind::Date, n),
+                Col::new("sessions", Kind::I32, n),
+                Col::new("events", Kind::I32, n),
+                Col::new("revenue_cents", Kind::I64, n),
+                Col::new("top_category", Kind::OptStr, n),
             ];
-            let batch = RecordBatch::try_new(us.clone(), cols).unwrap();
-            let f = File::create(ud_dir.join(format!("part-{:04}.parquet", pi))).unwrap();
-            let mut w = ArrowWriter::try_new(f, us.clone(), Some(props.clone())).unwrap();
-            w.write(&batch).unwrap();
-            w.close().unwrap();
+            for r in g.iter().flat_map(|(r, _)| r.iter()) {
+                c[0].bytes_with(|o| id_into(r.key, &fbm, o));
+                c[1].i32(r.day as i32);
+                c[2].i32(r.sessions as i32);
+                c[3].i32(r.events as i32);
+                c[4].i64(r.revenue);
+                match r.top {
+                    Some(t) => c[5].bytes(&cats[t as usize]),
+                    None => c[5].null(),
+                }
+            }
+            pq::write(&ud_dir.join(format!("part-{:04}.parquet", pi)), &c, n).unwrap();
         });
     };
     let write_camps = || {
-        let cs = Arc::new(Schema::new(vec![
-            Field::new("campaign_id", DataType::Utf8, false),
-            Field::new("channel", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("purchasing_sessions", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("assisted_sessions", DataType::Int64, false),
-        ]));
-        let mut cid = Vec::new();
-        let mut chan = Vec::new();
-        let mut cday = Vec::new();
-        let mut cv: [Vec<i64>; 4] = Default::default();
-        for c in 0..ncamp {
+        let n = (0..ncamp * ndays).filter(|&i| camp[i][0] != 0 || camp[i][3] != 0).count();
+        let mut c = [
+            Col::new("campaign_id", Kind::Str, n),
+            Col::new("channel", Kind::Str, n),
+            Col::new("day", Kind::Date, n),
+            Col::new("sessions", Kind::I32, n),
+            Col::new("purchasing_sessions", Kind::I32, n),
+            Col::new("revenue_cents", Kind::I64, n),
+            Col::new("assisted_sessions", Kind::I32, n),
+        ];
+        for ci in 0..ncamp {
             for d in 0..ndays {
-                let v = camp[c * ndays + d];
+                let v = camp[ci * ndays + d];
                 if v[0] == 0 && v[3] == 0 {
                     continue;
                 }
-                if c as u32 == organic {
-                    cid.push("organic".to_string());
-                    chan.push("organic".to_string());
+                if ci as u32 == organic {
+                    c[0].bytes(b"organic");
+                    c[1].bytes(b"organic");
                 } else {
-                    cid.push(s(camp_names[c].0));
-                    chan.push(s(camp_names[c].1));
+                    c[0].bytes(camp_names[ci].0);
+                    c[1].bytes(camp_names[ci].1);
                 }
-                cday.push((ws_day + d as i64) as i32);
-                for t in 0..4 {
-                    cv[t].push(v[t]);
-                }
+                c[2].i32((ws_day + d as i64) as i32);
+                c[3].i32(v[0] as i32);
+                c[4].i32(v[1] as i32);
+                c[5].i64(v[2]);
+                c[6].i32(v[3] as i32);
             }
         }
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(cid)),
-            Arc::new(StringArray::from(chan)),
-            Arc::new(Date32Array::from(cday)),
-            Arc::new(Int64Array::from(std::mem::take(&mut cv[0]))),
-            Arc::new(Int64Array::from(std::mem::take(&mut cv[1]))),
-            Arc::new(Int64Array::from(std::mem::take(&mut cv[2]))),
-            Arc::new(Int64Array::from(std::mem::take(&mut cv[3]))),
-        ];
-        let batch = RecordBatch::try_new(cs.clone(), cols).unwrap();
-        let f = File::create(cd_dir.join("part-0000.parquet")).unwrap();
-        let mut w = ArrowWriter::try_new(f, cs, Some(props.clone())).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
+        pq::write(&cd_dir.join("part-0000.parquet"), &c, n).unwrap();
     };
     rayon::join(write_users, write_camps);
     lap("written");

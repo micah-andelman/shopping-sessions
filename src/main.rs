@@ -330,6 +330,7 @@ unsafe impl<T> Send for Raw<T> {}
 unsafe impl<T> Sync for Raw<T> {}
 
 mod fast;
+mod pq;
 mod scan;
 
 fn main() {
