@@ -439,86 +439,93 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
     };
 
+    // Person partitions: survivors and clicks are scattered by hash(person key) so each
+    // partition is sorted on its own, in cache, instead of one global sort.
+    const NP: usize = 256;
+    #[inline]
+    fn ppart(k: u64) -> usize {
+        (mix(k ^ 0x5bd1_e995) >> 56) as usize
+    }
     // ---------------- dedup per bucket (smallest ingest wins; kept-but-invalid drops the event)
-    let dedup_job = || -> Vec<Vec<(u64, u64)>> {
-        (0..NB)
+    let dedup_job = || -> Vec<Vec<Vec<(u64, u64)>>> {
+        let ng = (nthreads * 4).min(NB);
+        (0..ng)
             .into_par_iter()
-            .map(|b| {
-                let n: usize = evp.iter().map(|g| g.0[b].len()).sum();
-                let mut t: hashbrown::HashTable<Ev> = hashbrown::HashTable::with_capacity(n);
-                for g in &evp {
-                    for e in &g.0[b] {
-                        let h = th(e.ekey);
-                        match t.find_mut(h, |x| x.ekey == e.ekey) {
-                            Some(x) => {
-                                if e.ing < x.ing {
-                                    *x = *e;
+            .map(|gi| {
+                let mut outp: Vec<Vec<(u64, u64)>> = (0..NP).map(|_| Vec::new()).collect();
+                let mut t: hashbrown::HashTable<Ev> = hashbrown::HashTable::new();
+                for b in (gi * NB / ng)..((gi + 1) * NB / ng) {
+                    let n: usize = evp.iter().map(|g| g.0[b].len()).sum();
+                    t.clear();
+                    t.reserve(n, |x| th(x.ekey));
+                    for g in &evp {
+                        for e in &g.0[b] {
+                            let h = th(e.ekey);
+                            match t.find_mut(h, |x| x.ekey == e.ekey) {
+                                Some(x) => {
+                                    if e.ing < x.ing {
+                                        *x = *e;
+                                    }
                                 }
-                            }
-                            None => {
-                                t.insert_unique(h, *e, |x| th(x.ekey));
+                                None => {
+                                    t.insert_unique(h, *e, |x| th(x.ekey));
+                                }
                             }
                         }
                     }
-                }
-                let mut out = Vec::with_capacity(t.len());
-                for e in t.iter() {
-                    if e.lo != NONE {
-                        out.push((person(e.ukey), e.lo));
+                    for e in t.iter() {
+                        if e.lo != NONE {
+                            let pk = person(e.ukey);
+                            outp[ppart(pk)].push((pk, e.lo));
+                        }
                     }
                 }
-                out
+                outp
             })
             .collect()
     };
 
-    // ---------------- clicks (no dedup needed: copies are identical)
-    let ck_job = || -> (Vec<Ck>, Fb) {
+    // ---------------- clicks (no dedup needed: copies are identical), scattered by person
+    let ck_job = || -> (Vec<Vec<Vec<Ck>>>, Fb) {
         let ch = chunks(ck_maps);
-        let parts: Vec<(Vec<Ck>, Fb)> = ch
+        let groups = split_groups(&ch, nthreads * 2);
+        let parts: Vec<(Vec<Vec<Ck>>, Fb)> = groups
             .par_iter()
-            .map(|&(mi, s, e)| {
-                let d: &'static [u8] = &ck_maps[mi][s..e];
-                let mut v = Vec::with_capacity(d.len() / 45 + 16);
+            .map(|grp| {
+                let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
                 let mut fb = Fb::new();
-                scan::<4>(d, |f| {
-                    let (cid, uid) = match (f[0], f[1]) {
-                        (Some(c), Some(u)) => (c, u),
-                        _ => return,
-                    };
-                    let ts = parse_ts(f[3]);
-                    if ts == BAD || ts < cws || ts >= we {
-                        return;
-                    }
-                    let camp = match f[2].and_then(|c| camp_map.get(c)) {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    let pkey = person(key_of(uid, &mut fb));
-                    v.push(Ck { pkey, lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
-                });
-                (v, fb)
+                for &(mi, s, e) in grp.iter() {
+                    let d: &'static [u8] = &ck_maps[mi][s..e];
+                    scan::<4>(d, |f| {
+                        let (cid, uid) = match (f[0], f[1]) {
+                            (Some(c), Some(u)) => (c, u),
+                            _ => return,
+                        };
+                        let ts = parse_ts(f[3]);
+                        if ts == BAD || ts < cws || ts >= we {
+                            return;
+                        }
+                        let camp = match f[2].and_then(|c| camp_map.get(c)) {
+                            Some(c) => c,
+                            None => return,
+                        };
+                        let pkey = person(key_of(uid, &mut fb));
+                        outp[ppart(pkey)].push(Ck { pkey, lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
+                    });
+                }
+                (outp, fb)
             })
             .collect();
-        let n: usize = parts.iter().map(|p| p.0.len()).sum();
-        let mut ck = Vec::with_capacity(n);
         let mut fb = Fb::new();
+        let mut cks = Vec::with_capacity(parts.len());
         for (v, f) in parts {
-            ck.extend_from_slice(&v);
+            cks.push(v);
             fb.extend(f);
         }
-        (ck, fb)
+        (cks, fb)
     };
 
-    let (eparts, (mut ck, cfb)) = if std::env::var("SS_SEQ").is_ok() {
-        let a = dedup_job();
-        lap("  dedup alone");
-        let b = ck_job();
-        lap("  clicks alone");
-        (a, b)
-    } else {
-        rayon::join(dedup_job, ck_job)
-    };
+    let (eparts, (cparts, cfb)) = rayon::join(dedup_job, ck_job);
     lap("dedup + clicks");
     let fbm = match merge_fb(evp.iter().map(|g| &g.1).chain(std::iter::once(&lfb)).chain(std::iter::once(&cfb))) {
         Some(m) => m,
@@ -526,44 +533,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     drop(evp);
 
-    // concatenate survivors
-    let n: usize = eparts.iter().map(|v| v.len()).sum();
-    let mut ek: Vec<(u64, u64)> = Vec::with_capacity(n);
-    unsafe { ek.set_len(n) };
-    {
-        let mut offs = Vec::with_capacity(eparts.len());
-        let mut o = 0usize;
-        for v in &eparts {
-            offs.push(o);
-            o += v.len();
-        }
-        let p = Raw(ek.as_mut_ptr());
-        eparts.par_iter().zip(offs.par_iter()).for_each(|(v, &o)| {
-            let p = &p;
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), p.0.add(o), v.len()) };
-        });
-    }
-    drop(eparts);
-    lap(&format!("{} valid events, {} valid clicks", n, ck.len()));
-
-    rayon::join(|| ek.par_sort_unstable(), || ck.par_sort_unstable_by_key(|c| (c.pkey, c.lo)));
-    lap("sorted");
-
-    // ---------------- sessions, credit, assists (parallel over person ranges)
     let ncamp = organic as usize + 1;
     let ncats = cats.len();
-    let parts = nthreads * 16;
-    let mut eb = vec![0usize];
-    for k in 1..parts {
-        let mut p = n * k / parts;
-        while p > 0 && p < n && ek[p].0 == ek[p - 1].0 {
-            p += 1;
-        }
-        if p > *eb.last().unwrap() && p < n {
-            eb.push(p);
-        }
-    }
-    eb.push(n);
 
     struct UserRow {
         key: u64,
@@ -678,10 +649,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
     };
 
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = eb
-        .par_windows(2)
-        .map(|w| {
-            let mut rows: Vec<UserRow> = Vec::with_capacity((w[1] - w[0]) / 8);
+    // per person partition: gather, sort in cache, walk persons
+    let ngr = (nthreads * 4).min(NP);
+    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..ngr)
+        .into_par_iter()
+        .map(|gi| {
+            let mut rows: Vec<UserRow> = Vec::new();
             let mut acc = Acc {
                 camp: vec![[0i64; 4]; ncamp * ndays],
                 cnt: vec![0u32; ncamp],
@@ -689,23 +662,38 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 catsum: vec![0i64; ncats],
                 touched: Vec::new(),
             };
-            let mut ci = ck.partition_point(|c| c.pkey < ek[w[0]].0);
-            let mut i = w[0];
-            while i < w[1] {
-                let key = ek[i].0;
-                let mut j = i + 1;
-                while j < w[1] && ek[j].0 == key {
-                    j += 1;
+            let mut ek: Vec<(u64, u64)> = Vec::new();
+            let mut ck: Vec<Ck> = Vec::new();
+            for p in (gi * NP / ngr)..((gi + 1) * NP / ngr) {
+                ek.clear();
+                ck.clear();
+                for g in &eparts {
+                    ek.extend_from_slice(&g[p]);
                 }
-                while ci < ck.len() && ck[ci].pkey < key {
-                    ci += 1;
+                for g in &cparts {
+                    ck.extend_from_slice(&g[p]);
                 }
-                let c0 = ci;
-                while ci < ck.len() && ck[ci].pkey == key {
-                    ci += 1;
+                ek.sort_unstable();
+                ck.sort_unstable_by_key(|c| (c.pkey, c.lo));
+                let n = ek.len();
+                let mut ci = 0usize;
+                let mut i = 0usize;
+                while i < n {
+                    let key = ek[i].0;
+                    let mut j = i + 1;
+                    while j < n && ek[j].0 == key {
+                        j += 1;
+                    }
+                    while ci < ck.len() && ck[ci].pkey < key {
+                        ci += 1;
+                    }
+                    let c0 = ci;
+                    while ci < ck.len() && ck[ci].pkey == key {
+                        ci += 1;
+                    }
+                    do_person(key, &ek[i..j], &ck[c0..ci], &mut acc, &mut rows);
+                    i = j;
                 }
-                do_person(key, &ek[i..j], &ck[c0..ci], &mut acc, &mut rows);
-                i = j;
             }
             (rows, acc.camp)
         })
