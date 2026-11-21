@@ -1267,95 +1267,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let nextt = AtomicUsize::new(0);
     let new_bufs = || Bufs { name: Vec::with_capacity(16), tmp: Vec::with_capacity(16), evs: Vec::new(), cks: Vec::new() };
     type Part = (UserOut, Vec<[i64; 4]>, Vec<(u32, u32, u32, u32)>);
-    let mut first: Vec<Part> = (0..nthreads)
-        .into_par_iter()
-        .map(|_| {
-            let mut rows = UserOut::new(est_out);
-            let mut acc = new_acc();
-            let mut bf = new_bufs();
-            let mut run: Vec<u64> = Vec::new();
-            // (person, stream, start, end) of runs that are not a whole person
-            let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
-            loop {
-                let si = nextt.fetch_add(1, Relaxed);
-                if si >= streams.len() {
-                    break;
-                }
-                let v = streams[si];
-                for (p, i, j) in v.each() {
-                    if ecnt[p as usize].load(Relaxed) as usize == j - i {
-                        let ev = &v.w[i..j];
-                        if ev.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
-                            run.clear();
-                            run.extend_from_slice(ev);
-                            run.sort_unstable();
-                            person(p as usize, &run, &mut acc, &mut rows, &mut bf);
-                        } else {
-                            person(p as usize, ev, &mut acc, &mut rows, &mut bf);
-                        }
-                    } else {
-                        split.push((p, si as u32, i as u32, j as u32));
-                    }
-                }
-            }
-            (rows, acc.camp, split)
-        })
-        .collect();
-    // split persons: their runs, ordered by stream (bucket order = index order), concatenated
-    let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
-    for r in first.iter_mut() {
-        split.append(&mut r.2);
-    }
-    split.sort_unstable();
-    let mut groups: Vec<(usize, usize, u32)> = Vec::new();
-    {
-        let mut i = 0;
-        while i < split.len() {
-            let mut j = i + 1;
-            while j < split.len() && split[j].0 == split[i].0 {
-                j += 1;
-            }
-            groups.push((i, j, split[i..j].iter().map(|r| r.3 - r.2).sum()));
-            i = j;
-        }
-    }
-    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.2)); // biggest first
-    lap(&format!("whole-run persons ({} split persons, {} split events)", groups.len(), groups.iter().map(|g| g.2 as u64).sum::<u64>()));
-    let nextg = AtomicUsize::new(0);
-    let more: Vec<Part> = (0..nthreads)
-        .into_par_iter()
-        .map(|_| {
-            let mut rows = UserOut::new(1024);
-            let mut acc = new_acc();
-            let mut bf = new_bufs();
-            let mut run: Vec<u64> = Vec::new();
-            loop {
-                let gi = nextg.fetch_add(1, Relaxed);
-                if gi >= groups.len() {
-                    break;
-                }
-                let (i, j, _) = groups[gi];
-                run.clear();
-                for &(_, si, a, b) in &split[i..j] {
-                    run.extend_from_slice(&streams[si as usize].w[a as usize..b as usize]);
-                }
-                if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
-                    run.sort_unstable();
-                }
-                person(split[i].0 as usize, &run, &mut acc, &mut rows, &mut bf);
-            }
-            (rows, acc.camp, Vec::new())
-        })
-        .collect();
-    let mut results: Vec<(UserOut, Vec<[i64; 4]>)> = first.into_iter().chain(more).map(|r| (r.0, r.1)).collect();
-    lap("simple persons");
-
-    // ---------------- complex identities: exact sort-based path
-    {
+    // ---------------- complex identities: exact sort-based path. Independent of the whole-run
+    // persons below, so it runs beside them (rayon::join); its rows are still appended last.
+    let complex = || -> (UserOut, Vec<[i64; 4]>) {
         let mut uf = uf;
         let mut cev: Vec<(u64, u64)> = odd_cx;
-        for (_, c) in dd {
-            cev.extend(c);
+        for (_, c) in &dd {
+            cev.extend_from_slice(c);
         }
         let mut cck: Vec<(u64, u64, u64)> = Vec::new();
         for c in ck_cx {
@@ -1413,8 +1331,92 @@ pub fn run(data: &Path, out: &Path) -> bool {
             do_person(&cx, best[c as usize].as_ref().unwrap(), &evs, &cks, &mut acc, &mut rows);
             i = j;
         }
-        results.push((rows, acc.camp));
+        (rows, acc.camp)
+    };
+    let (mut first, cxres): (Vec<Part>, (UserOut, Vec<[i64; 4]>)) = rayon::join(|| (0..nthreads)
+        .into_par_iter()
+        .map(|_| {
+            let mut rows = UserOut::new(est_out);
+            let mut acc = new_acc();
+            let mut bf = new_bufs();
+            let mut run: Vec<u64> = Vec::new();
+            // (person, stream, start, end) of runs that are not a whole person
+            let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
+            loop {
+                let si = nextt.fetch_add(1, Relaxed);
+                if si >= streams.len() {
+                    break;
+                }
+                let v = streams[si];
+                for (p, i, j) in v.each() {
+                    if ecnt[p as usize].load(Relaxed) as usize == j - i {
+                        let ev = &v.w[i..j];
+                        if ev.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                            run.clear();
+                            run.extend_from_slice(ev);
+                            run.sort_unstable();
+                            person(p as usize, &run, &mut acc, &mut rows, &mut bf);
+                        } else {
+                            person(p as usize, ev, &mut acc, &mut rows, &mut bf);
+                        }
+                    } else {
+                        split.push((p, si as u32, i as u32, j as u32));
+                    }
+                }
+            }
+            (rows, acc.camp, split)
+        })
+        .collect::<Vec<Part>>(), complex);
+    // split persons: their runs, ordered by stream (bucket order = index order), concatenated
+    let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for r in first.iter_mut() {
+        split.append(&mut r.2);
     }
+    split.sort_unstable();
+    let mut groups: Vec<(usize, usize, u32)> = Vec::new();
+    {
+        let mut i = 0;
+        while i < split.len() {
+            let mut j = i + 1;
+            while j < split.len() && split[j].0 == split[i].0 {
+                j += 1;
+            }
+            groups.push((i, j, split[i..j].iter().map(|r| r.3 - r.2).sum()));
+            i = j;
+        }
+    }
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.2)); // biggest first
+    lap(&format!("whole-run persons ({} split persons, {} split events)", groups.len(), groups.iter().map(|g| g.2 as u64).sum::<u64>()));
+    let nextg = AtomicUsize::new(0);
+    let more: Vec<Part> = (0..nthreads)
+        .into_par_iter()
+        .map(|_| {
+            let mut rows = UserOut::new(1024);
+            let mut acc = new_acc();
+            let mut bf = new_bufs();
+            let mut run: Vec<u64> = Vec::new();
+            loop {
+                let gi = nextg.fetch_add(1, Relaxed);
+                if gi >= groups.len() {
+                    break;
+                }
+                let (i, j, _) = groups[gi];
+                run.clear();
+                for &(_, si, a, b) in &split[i..j] {
+                    run.extend_from_slice(&streams[si as usize].w[a as usize..b as usize]);
+                }
+                if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                    run.sort_unstable();
+                }
+                person(split[i].0 as usize, &run, &mut acc, &mut rows, &mut bf);
+            }
+            (rows, acc.camp, Vec::new())
+        })
+        .collect();
+    let mut results: Vec<(UserOut, Vec<[i64; 4]>)> = first.into_iter().chain(more).map(|r| (r.0, r.1)).collect();
+    lap("simple persons");
+
+    results.push(cxres);
     lap("complex identities");
 
     let mut camp = vec![[0i64; 4]; ncamp * ndays];
