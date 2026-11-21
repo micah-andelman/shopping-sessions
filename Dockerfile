@@ -14,6 +14,4 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 FROM scratch
 COPY --from=build /sessions /sessions
 # Runs as uid 1000 with a read-only root; reads DATA_DIR, writes OUTPUT_DIR only.
-# One-pass record path (person resolved at parse, losers marked dead in place). Revert = delete this line.
-ENV SS_ONEPASS=1
 CMD ["/sessions"]
