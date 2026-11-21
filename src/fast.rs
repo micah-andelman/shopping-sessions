@@ -1008,16 +1008,32 @@ pub fn run(data: &Path, out: &Path) -> bool {
         None => return false,
     };
     lap(&format!("links ({} ids) and events parsed", ltab.n));
-    // The event and link files are fully parsed. Drop their page-table entries now, on a spare
-    // thread, instead of leaving ~1.6 GB of 4 KB file mappings to be torn down serially at exit
-    // (~18 ms at 20M, in the measured wall time). MADV_DONTNEED on a read-only file mapping only
-    // unmaps: fallback IDs that still point into a file fault back in from the page cache.
-    if std::env::var("SS_NOEARLYUNMAP").is_err() {
-        std::thread::spawn(move || {
-            for m in ev_maps.iter().chain(lk_maps.iter()) {
+    // The event and link files (and the clicks, when parsed early) are fully parsed. Drop their
+    // page-table entries now, on a spare thread, instead of leaving ~1.9 GB of 4 KB file mappings
+    // to be torn down serially at exit (~18 ms at 20M, inside the measured wall time).
+    // MADV_DONTNEED on a read-only file mapping only unmaps: fallback IDs that still point into
+    // a file fault back in from the page cache. SS_EARLYUNMAP=0 disables, =sync waits for it.
+    let eu = std::env::var("SS_EARLYUNMAP").unwrap_or_default();
+    if eu != "0" {
+        let with_clicks = ck_raw.is_some();
+        let h = std::thread::spawn(move || {
+            let rss_file = || {
+                let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                st.lines().find(|l| l.starts_with("RssFile")).unwrap_or("").to_string()
+            };
+            let before = if verbose { rss_file() } else { String::new() };
+            let t = std::time::Instant::now();
+            let cks: &[Mmap] = if with_clicks { ck_maps } else { &[] };
+            for m in ev_maps.iter().chain(lk_maps.iter()).chain(cks.iter()) {
                 unsafe { libc::madvise(m.as_ptr() as *mut libc::c_void, m.len(), libc::MADV_DONTNEED) };
             }
+            if verbose {
+                eprintln!("  inputs unmapped in {:.4}s ({} -> {})", t.elapsed().as_secs_f64(), before, rss_file());
+            }
         });
+        if eu == "sync" {
+            let _ = h.join();
+        }
     }
 
     // Person partitions: survivors and clicks are scattered by hash(person key) so each
