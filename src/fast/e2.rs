@@ -775,6 +775,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // SS_E2ABL=1..4 (diagnostic): stop the event row body after scan / +timestamps / +ID decode /
     // +all fields (no record write), print the parse time and exit.
     let abl: u32 = std::env::var("SS_E2ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Each parse job first maps its input range with MADV_POPULATE_READ (one call instead of a
+    // page fault per page; claude-b7's measurement: less sys time). SS_E2POP=0 turns it off; the
+    // first rejection (EINVAL on kernels before 5.14) turns it off for the rest of the run.
+    // After a job is parsed, its page-aligned interior is unmapped (MADV_DONTNEED) by the same
+    // worker, so page-table entries never pile up (read-only file mappings: odd IDs that point
+    // there fault back in from the page cache). SS_E2DROP=0 turns it off.
+    let dropj = std::env::var("SS_E2DROP").map_or(true, |v| v != "0");
+    let pop = std::sync::atomic::AtomicBool::new(std::env::var("SS_E2POP").map_or(true, |v| v != "0"));
     let wks: Vec<Wk> = (0..nthreads)
         .into_par_iter()
         .map(|t| {
@@ -791,12 +799,40 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 fail: 0,
             };
             let mut memo = TsMemo::default();
+            let mut last: Option<usize> = None;
             loop {
+                if let Some(lj) = last.take() {
+                    let (kind, mi, s, e) = jobs[lj];
+                    let m = match kind {
+                        0 => &lk_maps[mi],
+                        1 => &ck_maps[mi],
+                        _ => &ev_maps[mi],
+                    };
+                    let (a, b) = ((s + 4095) & !4095, e & !4095);
+                    if b > a {
+                        // Safety: read-only file mapping; see `dropj`.
+                        unsafe { libc::madvise(m.as_ptr().add(a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
+                    }
+                }
                 let j = next.fetch_add(1, Relaxed);
                 if j >= jobs.len() {
                     break;
                 }
+                if dropj {
+                    last = Some(j);
+                }
                 let (kind, mi, s, e) = jobs[j];
+                if pop.load(Relaxed) {
+                    let m = match kind {
+                        0 => &lk_maps[mi],
+                        1 => &ck_maps[mi],
+                        _ => &ev_maps[mi],
+                    };
+                    let s0 = s & !4095;
+                    if m.advise_range(memmap2::Advice::PopulateRead, s0, e - s0).is_err() {
+                        pop.store(false, Relaxed);
+                    }
+                }
                 match kind {
                     0 => {
                         let d: &'static [u8] = &lk_maps[mi][s..e];
