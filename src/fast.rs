@@ -304,16 +304,60 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
         whole(ck_maps, &mut wins);
         let wins: &'static [(&'static Mmap, usize, usize)] = Vec::leak(wins);
-        const LANES: usize = 4;
-        for lane in 0..LANES {
-            std::thread::spawn(move || {
-                for (i, &(m, s, e)) in wins.iter().enumerate() {
-                    if i % LANES == lane {
-                        let s0 = s & !4095;
+        let mode = std::env::var("SS_IO").unwrap_or_else(|_| "advise".into());
+        let lanes: usize = std::env::var("SS_IOT").ok().and_then(|v| v.parse().ok()).unwrap_or(if mode == "touch" { 16 } else { 4 });
+        if mode == "populate" {
+            // MADV_POPULATE_READ (Linux 5.14+): read AND map each window, so parsers never fault.
+            // Falls back to WILLNEED where unsupported.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            for _ in 0..lanes {
+                std::thread::spawn(move || loop {
+                    let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= wins.len() {
+                        break;
+                    }
+                    let (m, s, e) = wins[i];
+                    let s0 = s & !4095;
+                    if m.advise_range(memmap2::Advice::PopulateRead, s0, e - s0).is_err() {
                         let _ = m.advise_range(memmap2::Advice::WillNeed, s0, e - s0);
                     }
-                }
-            });
+                });
+            }
+        } else if mode == "touch" {
+            // Real reads in parse order: each lane faults in whole windows (one load per page),
+            // so `lanes` windows are always in flight; parsers then hit the page cache.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            for &(m, _, _) in wins.iter() {
+                let _ = m.advise(memmap2::Advice::Sequential);
+            }
+            for _ in 0..lanes {
+                std::thread::spawn(move || loop {
+                    let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= wins.len() {
+                        break;
+                    }
+                    let (m, s, e) = wins[i];
+                    let p = m.as_ptr();
+                    let mut o = s & !4095;
+                    let mut acc = 0u8;
+                    while o < e {
+                        acc ^= unsafe { std::ptr::read_volatile(p.add(o)) };
+                        o += 4096;
+                    }
+                    std::hint::black_box(acc);
+                });
+            }
+        } else if mode == "advise" {
+            for lane in 0..lanes {
+                std::thread::spawn(move || {
+                    for (i, &(m, s, e)) in wins.iter().enumerate() {
+                        if i % lanes == lane {
+                            let s0 = s & !4095;
+                            let _ = m.advise_range(memmap2::Advice::WillNeed, s0, e - s0);
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -803,5 +847,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     rayon::join(write_users, write_camps);
     lap("written");
+    if verbose {
+        // peak RSS and total CPU seconds (user+sys), the board tracks CPU-seconds closely
+        let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let hwm = st.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("").to_string();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+        let tk = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
+        eprintln!("{}  cpu user {:.2}s sys {:.2}s", hwm, tk(11), tk(12));
+    }
     true
 }

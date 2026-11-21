@@ -69,6 +69,12 @@ fn open_all(paths: &[PathBuf]) -> Vec<Mmap> {
         .collect()
 }
 
+/// Chunk size; SS_CHUNK overrides it (tests use tiny chunks to stress split/merge logic).
+fn chunk_size() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("SS_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&c: &usize| c > 0).unwrap_or(CHUNK))
+}
+
 /// Byte ranges (map index, start, end) of data lines (each file's header line skipped), biggest first.
 fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
@@ -80,7 +86,7 @@ fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
         };
         let mut s = start;
         while s < d.len() {
-            let mut e = (s + CHUNK).min(d.len());
+            let mut e = (s + chunk_size()).min(d.len());
             if e < d.len() {
                 e = match memchr::memchr(b'\n', &d[e..]) {
                     Some(p) => e + p + 1,
@@ -338,6 +344,7 @@ fn main() {
     if std::env::var("SS_LEGACY").is_err() && fast::run(&data, &out) {
         std::process::exit(0);
     }
+    eprintln!("note: fast path declined, running the byte-exact legacy path");
     legacy(data, out);
 }
 

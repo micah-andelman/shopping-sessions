@@ -1,4 +1,29 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions: team "5-hour limit reached"
+
+A Rust pipeline for the Databricks Shopping Sessions track (`src/`). The Dockerfile builds one static binary into a `FROM scratch` image. The DuckDB starter notes below are kept for reference.
+
+## How it works
+
+- `src/fast.rs` is the main path:
+  - Every ID becomes an exact 64-bit key: up to 10 bytes of `[0-9A-Z_a-z]` packed 6 bits per byte, so integer order equals byte order. Other IDs are hashed, and a global check confirms no two different strings share a hash.
+  - The CSVs are memory-mapped and read ahead by background threads in parse order.
+  - Event copies are scattered by `event_id` into 256 buckets and deduped per bucket.
+  - Survivors and clicks are scattered into 256 person partitions, each sorted in cache.
+  - Each person's sessions, credit and assists come from one pass with a sliding 7-day click window.
+- `src/scan.rs` is a one-pass AVX2 CSV scanner. It builds comma, newline and quote bitmasks per 64 bytes and checks the dialect in the same pass. It is fuzz-tested against the scalar splitter.
+- `src/main.rs` keeps the earlier byte-exact pipeline (v4). It runs whenever the fast path's assumptions do not hold: window too long, too many categories, or a hash collision. `SS_LEGACY=1` forces it for differential tests.
+- `ref/reference.py` is an independent, slow Python implementation of `rules.md`. `tools/verify.sh` checks the 36 fixtures, the dev answer, 20M events against v4, and 10 generator seeds against the reference.
+
+## Credits
+
+All code here was written by our team during the event. Ideas we learned from other teams' public write-ups and then implemented our own way:
+- Order-preserving packed integer ID keys: Wolverines, axhiao, Th3r0n.
+- Background read-ahead for cold-cache input: Eagle Eye.
+- Bitmask-based SIMD CSV scanning, hash-partitioned dedup, and person partitioning instead of a global sort: several teams, including enkyuan/polaris and Wolverines.
+
+Libraries: memmap2, memchr, rayon, hashbrown, foldhash, mimalloc, arrow-array, arrow-schema, parquet (all MIT or Apache-2.0).
+
+## Original DuckDB starter notes
 
 This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
 
