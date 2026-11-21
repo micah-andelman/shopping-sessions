@@ -600,6 +600,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // SS_E2ABL=1..4 (diagnostic): stop the event row body after scan / +timestamps / +ID decode /
     // +all fields (no record write), print the parse time and exit.
     let abl: u32 = std::env::var("SS_E2ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // SS_E2CAB=1..4 / SS_E2LAB=1 (diagnostic, b7): stop the click row body after scan / +ts /
+    // +campaign / +ID decode (no push); stop the link row body after the scan. Use with SS_E2ABL.
+    let cab: u32 = std::env::var("SS_E2CAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let lab: u32 = std::env::var("SS_E2LAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let wks: Vec<Wk> = (0..nthreads)
         .into_par_iter()
         .map(|t| {
@@ -626,6 +630,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     0 => {
                         let d: &'static [u8] = &lk_maps[mi][s..e];
                         scan3a::<2>(d, |f| {
+                            if lab == 1 {
+                                w.maxp = w.maxp.wrapping_add(f[0].map_or(0, |x| x.len()) as u32);
+                                return;
+                            }
                             if let [Some(a), Some(b)] = *f {
                                 match (user(a, ku, pb), user(b, ku, pb)) {
                                     (Some((pa, aa)), Some((pb_, ab))) if pa == pb_ => {
@@ -660,16 +668,33 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                 (Some(c), Some(u)) => (c, u),
                                 _ => return,
                             };
+                            if cab == 1 {
+                                w.maxp = w.maxp.wrapping_add((cid.len() ^ uid.len()) as u32);
+                                return;
+                            }
                             let ts = parse_ts_memo(f[3], &mut memo);
                             if ts == BAD || ts < cws || ts >= we {
+                                return;
+                            }
+                            if cab == 2 {
+                                w.maxp = w.maxp.wrapping_add(ts as u32 & 1);
                                 return;
                             }
                             let camp = match f[2].and_then(|c| camp_tab.get(c, &camp_map)) {
                                 Some(c) => c,
                                 None => return,
                             };
+                            if cab == 3 {
+                                w.maxp = w.maxp.wrapping_add(camp);
+                                return;
+                            }
                             let ckey = key_of(cid, &mut w.fb);
                             let lo = ((ts - cws) as u64) << 32 | camp as u64;
+                            if cab == 4 {
+                                let u = user(uid, ku, pb).map_or(0, |x| x.0);
+                                w.maxp = w.maxp.wrapping_add((ckey ^ lo) as u32 ^ u);
+                                return;
+                            }
                             match user(uid, ku, pb) {
                                 Some((p, a)) => {
                                     w.maxp = w.maxp.max(p);
