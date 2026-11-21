@@ -4,7 +4,8 @@ A Rust pipeline for the Databricks Shopping Sessions track (`src/`). The Dockerf
 
 ## How it works
 
-- `src/fast.rs` is the main path:
+- `src/fast/e2.rs` (engine 2) runs first. It is built for IDs written the way the published generator writes them: a prefix, then base 36 of a scrambled counter. It recovers the scramble keys from a sample at startup and decodes event IDs to dense indices (direct-indexed dedup) and user IDs to (person, alias), so identity is a per-person alias union with a general union-find only for links that leave a person. Correctness never depends on the keys, because decoding is a bijection; IDs outside the dense ranges take exact byte-keyed paths. When the data doesn't fit the layout, it writes nothing and the path below runs instead.
+- `src/fast.rs` is the main path when engine 2 declines:
   - Every ID becomes an exact 64-bit key: up to 10 bytes of `[0-9A-Z_a-z]` packed 6 bits per byte, so integer order equals byte order. Other IDs are hashed, and a global check confirms no two different strings share a hash.
   - The CSVs are memory-mapped and read ahead by background threads in parse order.
   - Event copies are scattered by `event_id` into 256 buckets and deduped per bucket.
@@ -19,6 +20,7 @@ A Rust pipeline for the Databricks Shopping Sessions track (`src/`). The Dockerf
 All code here was written by our team during the event. Ideas we learned from other teams' public write-ups and then implemented our own way:
 - Order-preserving packed integer ID keys: Wolverines, axhiao, Th3r0n.
 - Background read-ahead for cold-cache input: Eagle Eye.
+- Decoding the generator's scrambled IDs to counters (key recovery from a sample, direct-indexed dedup, person arithmetic for identity): Team 67's public design, read for ideas only; the code in `src/fast/e2.rs` is ours.
 - Bitmask-based SIMD CSV scanning, hash-partitioned dedup, and person partitioning instead of a global sort: several teams, including enkyuan/polaris and Wolverines.
 
 Libraries: memmap2, memchr, rayon, hashbrown, foldhash, mimalloc, arrow-array, arrow-schema, parquet (all MIT or Apache-2.0).
