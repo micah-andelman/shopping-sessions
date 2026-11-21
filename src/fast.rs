@@ -60,8 +60,9 @@ static CODE: [u8; 256] = code_table();
 static DEC: [u8; 64] = dec_table();
 
 /// Exact order-preserving key for short alphanumeric IDs. `b` is non-empty.
+/// Reference implementation: one table lookup per byte.
 #[inline]
-fn pack(b: &[u8]) -> Option<u64> {
+fn pack_ref(b: &[u8]) -> Option<u64> {
     if b.len() > 10 {
         return None;
     }
@@ -76,6 +77,60 @@ fn pack(b: &[u8]) -> Option<u64> {
         sh = sh.wrapping_sub(6);
     }
     Some(k)
+}
+
+/// Same key as `pack_ref` for every input, computed from one 16-byte load: two nibble lookups
+/// classify every byte, a third gives its 6-bit code, PEXT squeezes the codes together.
+/// The load reads up to 16 - len bytes past the field, so it is only used when all 16 bytes lie
+/// in the page that holds the field's first byte (a page that holds a readable byte is readable
+/// to its end, also for the last page of a file mapping); fields that start in the last 15 bytes
+/// of a page take `pack_ref`. Bytes past `len` are masked out before they can affect the result.
+#[inline]
+fn pack(b: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "bmi2"))]
+    {
+        let n = b.len();
+        if n > 10 {
+            return None;
+        }
+        if n != 0 && (b.as_ptr() as usize) & 4095 <= 4096 - 16 {
+            // SAFETY: the 16 bytes at b.as_ptr() are inside one mapped page (see above).
+            return unsafe { pack16(b.as_ptr(), n) };
+        }
+    }
+    pack_ref(b)
+}
+
+/// `p` must be readable for 16 bytes; `n <= 10` is the field length.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack16(p: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    debug_assert!(n <= 10);
+    let v = _mm_loadu_si128(p as *const __m128i);
+    // Class bit per high nibble: 3x -> 1, 4x/6x -> 2, 5x -> 4, 7x -> 8 (everything else 0), and
+    // per low nibble the set of classes in which that low nibble is an alphabet byte:
+    // 30-39 digits, 41-4F / 61-6F letters, 50-5A + 5F ('_'), 70-7A. A byte is valid iff the two
+    // sets intersect. pshufb yields 0 for index bytes >= 0x80, so non-ASCII is never valid.
+    let lo_lut = _mm_setr_epi8(13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 14, 2, 2, 2, 2, 6);
+    let hi_lut = _mm_setr_epi8(0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0);
+    // code = byte + offset: '0' -> 1, 'A' -> 11, 'a' -> 38; '_' (0x5F) -> 37 needs 4 less than 'P'..'Z'.
+    let off_lut = _mm_setr_epi8(0, 0, 0, -0x2F, -0x36, -0x36, -0x3B, -0x3B, 0, 0, 0, 0, 0, 0, 0, 0);
+    let hi_n = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    let class = _mm_and_si128(_mm_shuffle_epi8(lo_lut, v), _mm_shuffle_epi8(hi_lut, hi_n));
+    let bad = _mm_movemask_epi8(_mm_cmpeq_epi8(class, _mm_setzero_si128())) as u32;
+    if bad & ((1u32 << n) - 1) != 0 {
+        return None;
+    }
+    let us = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(-4));
+    let codes = _mm_add_epi8(_mm_add_epi8(v, _mm_shuffle_epi8(off_lut, hi_n)), us);
+    // Keep only the first n code bytes (BZHI with an index >= 64 keeps everything).
+    let lo = _bzhi_u64(_mm_cvtsi128_si64(codes) as u64, 8 * n as u32);
+    let hi = _bzhi_u64(_mm_extract_epi16(codes, 4) as u64, (8 * n as u32).saturating_sub(64));
+    // Byte 0 must end up in the top 6 bits of the 60-bit key: reverse the bytes, squeeze 8 codes
+    // into 48 bits, then append codes 8 and 9.
+    let a = _pext_u64(lo.swap_bytes(), 0x3F3F_3F3F_3F3F_3F3F);
+    Some(a << 12 | (hi & 0xFF) << 6 | hi >> 8)
 }
 
 type Fb = Vec<(u64, &'static [u8])>;
@@ -1256,4 +1311,181 @@ pub fn run(data: &Path, out: &Path) -> bool {
         eprintln!("{}  cpu user {:.2}s sys {:.2}s", hwm, tk(11), tk(12));
     }
     true
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+    const ALPHA: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+    /// Check `pack` against `pack_ref` with the field at a random offset of a page-aligned
+    /// buffer that straddles a page boundary, so both the wide path and the page-edge path are
+    /// compared, with random bytes around the field.
+    #[repr(align(4096))]
+    struct Pages([u8; 8192]);
+    fn check(id: &[u8], s: &mut u64, pages: &mut Pages) {
+        // Field start anywhere in the last 48 bytes of the first page or first 16 of the second.
+        let o = 4096 - 48 + (rng(s) % 64) as usize;
+        for x in pages.0[4096 - 64..4096 + 64].iter_mut() {
+            *x = rng(s) as u8;
+        }
+        pages.0[o..o + id.len()].copy_from_slice(id);
+        let f = &pages.0[o..o + id.len()];
+        assert_eq!(pack(f), pack_ref(f), "id {:?} at page offset {}", id, o & 4095);
+    }
+
+    #[test]
+    fn alphabet_is_the_reference_alphabet() {
+        // 63 codes 1..=63 in byte order, nothing else; 0 is "no byte" so length is part of the key.
+        let mut next = 1u8;
+        for b in 0..=255u8 {
+            if ALPHA.contains(&b) {
+                assert_eq!(CODE[b as usize], next);
+                next += 1;
+            } else {
+                assert_eq!(CODE[b as usize], 0);
+            }
+        }
+        assert_eq!(next, 64);
+    }
+
+    #[test]
+    fn every_byte_value_at_every_position_and_length() {
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        let mut pages = Box::new(Pages([0; 8192]));
+        for len in 1..=16usize {
+            for pos in 0..len {
+                for b in 0..=255u8 {
+                    for fill in [b'0', b'z', b'_', b'A'] {
+                        for _ in 0..4 {
+                            let mut id = vec![fill; len];
+                            id[pos] = b;
+                            check(&id, &mut s, &mut pages);
+                        }
+                    }
+                }
+            }
+        }
+        check(b"", &mut s, &mut pages);
+    }
+
+    #[test]
+    fn random_and_adversarial_ids_match_reference() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pages = Box::new(Pages([0; 8192]));
+        // Bytes next to the alphabet ranges, separators, CR, NUL, DEL and non-ASCII.
+        let edge: &[u8] = b"/:@[^`{\x7f\x00\r\n\t ,\"-.\x80\xb0\xb9\xc1\xdf\xe1\xff\x30\x39\x41\x5a\x5f\x61\x7a";
+        for i in 0..6_000_000u32 {
+            let len = 1 + (rng(&mut s) % 16) as usize;
+            let mut id = [0u8; 16];
+            let mode = i % 4;
+            for x in id[..len].iter_mut() {
+                let r = rng(&mut s);
+                *x = match mode {
+                    0 => ALPHA[(r % 63) as usize],
+                    1 => r as u8,
+                    2 => {
+                        if r % 9 == 0 {
+                            edge[(r >> 8) as usize % edge.len()]
+                        } else {
+                            ALPHA[(r >> 8) as usize % 63]
+                        }
+                    }
+                    _ => {
+                        if r % 16 == 0 {
+                            (r >> 8) as u8
+                        } else {
+                            ALPHA[(r >> 8) as usize % 63]
+                        }
+                    }
+                };
+            }
+            check(&id[..len], &mut s, &mut pages);
+        }
+    }
+
+    #[test]
+    fn keys_are_exact_and_order_preserving() {
+        // Different strings never share a key, and key order is byte order (all sampled pairs).
+        let mut s = 0xDEAD_BEEF_1234_5677u64;
+        let mut ids: Vec<Vec<u8>> = [&b"a"[..], b"a0", b"a00", b"ab", b"aB", b"a_", b"0", b"zzzzzzzzzz", b"0000000000", b"000000000", b"_", b"Z", b"z"]
+            .iter()
+            .map(|x| x.to_vec())
+            .collect();
+        for _ in 0..2500 {
+            let len = 1 + (rng(&mut s) % 10) as usize;
+            ids.push((0..len).map(|_| ALPHA[(rng(&mut s) % 6 * 12) as usize]).collect());
+        }
+        let keys: Vec<u64> = ids.iter().map(|i| pack(i).unwrap()).collect();
+        for k in &keys {
+            assert!(*k != 0 && *k & FB == 0 && *k != NONE);
+        }
+        for i in 0..ids.len() {
+            for j in 0..ids.len() {
+                assert_eq!(ids[i].cmp(&ids[j]), keys[i].cmp(&keys[j]), "{:?} {:?}", ids[i], ids[j]);
+            }
+        }
+        // Round trip through the decoder.
+        let m = HashMap::new();
+        for (i, k) in ids.iter().zip(keys.iter()) {
+            assert_eq!(&bytes_of(*k, &m), i);
+        }
+    }
+
+    #[test]
+    fn bytes_outside_the_alphabet_never_alias() {
+        // A trailing CR, NUL, space, '-' or non-ASCII byte makes a different ID: it must take the
+        // hashed fallback (flag bit set) and be recorded for the byte-exact collision check.
+        let mut fb = Fb::new();
+        let plain = key_of(b"e3", &mut fb);
+        assert!(fb.is_empty() && plain & FB == 0);
+        let odd: [&'static [u8]; 13] =
+            [b"e3\r", b"e3\0", b"e3 ", b"e3-", b"e3.", b"e3\t", b"\xef\xbc\x93", b"e\xd9\xa3", b"e3\xff", b" e3", b"e3@", b"abcdefghijk", b"e3\0\0\0\0\0\0\0\0"];
+        let mut seen = vec![plain];
+        for (i, id) in odd.iter().enumerate() {
+            let k = key_of(id, &mut fb);
+            assert!(k & FB != 0, "{:?}", id);
+            assert_eq!(fb.len(), i + 1);
+            assert_eq!(fb[i], (k, *id));
+            assert!(!seen.contains(&k));
+            seen.push(k);
+        }
+    }
+
+    /// Fields at the very end of a mapping whose next page is unmapped (a file whose size is a
+    /// multiple of 4096): `pack` must not read past the page. The test faults if it does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_read_past_a_mapping_that_ends_on_a_page_boundary() {
+        unsafe {
+            let pg = 4096usize;
+            let m = libc::mmap(std::ptr::null_mut(), 3 * pg, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            assert!(m != libc::MAP_FAILED);
+            let base = (m as *mut u8).add(pg);
+            assert_eq!(libc::mprotect(base as *mut libc::c_void, pg, libc::PROT_READ | libc::PROT_WRITE), 0);
+            // [PROT_NONE][readable page][PROT_NONE]
+            let page = std::slice::from_raw_parts_mut(base, pg);
+            let mut s = 77u64;
+            for x in page.iter_mut() {
+                *x = ALPHA[(rng(&mut s) % 63) as usize];
+            }
+            let page: &[u8] = page;
+            for len in 0..=16usize {
+                for end_gap in 0..=40usize {
+                    let f = &page[pg - end_gap - len..pg - end_gap];
+                    assert_eq!(pack(f), pack_ref(f));
+                }
+                let f = &page[..len];
+                assert_eq!(pack(f), pack_ref(f));
+            }
+            libc::munmap(m, 3 * pg);
+        }
+    }
 }
