@@ -204,6 +204,9 @@ fn recover_event_key(ws: &[u64], w0: u64, lim: u64, eb: u64) -> Option<u64> {
 const BSH: u32 = 15;
 /// Click buckets: 2^CB persons each.
 const CB: u32 = 10;
+/// The low CB bits of a person, kept in a click's `lo` at bits 18..28 (campaigns < 2^18).
+const PLO: u64 = (1 << CB) - 1;
+const PSH: u32 = 18;
 const BSZ: usize = 1 << BSH;
 const ING_BAD: u64 = (1 << 21) - 1;
 #[inline]
@@ -294,9 +297,9 @@ struct Wk {
     oddev: Vec<(u64, [u64; 2])>,
     oddu: Vec<u64>,
     fb: Fb,
-    /// simple clicks: (person, (ts - cws) << 32 | alias << 28 | campaign, click key)
-    /// by person bucket (person >> CB)
-    cks: Vec<Vec<(u32, u64, u64)>>,
+    /// simple clicks: ((ts - cws) << 32 | alias << 28 | (person & PLO) << 18 | campaign, click key)
+    /// by person bucket (person >> CB); the bucket gives the rest of the person
+    cks: Vec<Vec<(u64, u64)>>,
     /// odd-user clicks: (user key, (ts - cws) << 32 | campaign, click key)
     cko: Vec<(u64, u64, u64)>,
     li: Vec<(u32, u8, u8)>,
@@ -575,7 +578,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         }
     }
     let organic = camp_names.len() as u32;
-    if organic as u64 >= 1 << 28 {
+    if organic as u64 >= 1 << PSH {
         return decline("campaign count");
     }
     let camp_tab = PackTab::new(camp_names.iter().enumerate().map(|(i, c)| (c.0, i as u32)));
@@ -774,7 +777,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                     if w.cks[cb].capacity() == 0 {
                                         w.cks[cb].reserve(ccap); // untouched capacity costs nothing
                                     }
-                                    w.cks[cb].push((p, lo | (a as u64) << 28, ckey));
+                                    w.cks[cb].push((lo | (a as u64) << 28 | (p as u64 & PLO) << PSH, ckey));
                                 }
                                 None => {
                                     let uk = key_of(uid, &mut w.fb);
@@ -1064,11 +1067,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut n = 0usize;
                 for w in &wks {
                     if let Some(v) = w.cks.get(cb) {
-                        for &(p, lo, ck) in v {
+                        for &(lo, ck) in v {
+                            let q = ((lo >> PSH) & PLO) as u32;
+                            let p = (cb as u32) << CB | q;
                             if is_c(&cplx, p as usize) {
-                                cx.push((node_s(p, ((lo >> 28) & 15) as u32), lo & !(15u64 << 28), ck));
+                                cx.push((node_s(p, ((lo >> 28) & 15) as u32), lo & !(15u64 << 28 | PLO << PSH), ck));
                             } else {
-                                cnt[(p & ((1 << CB) - 1)) as usize + 1] += 1;
+                                cnt[q as usize + 1] += 1;
                                 n += 1;
                             }
                         }
@@ -1084,10 +1089,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut v: Vec<(u64, u64)> = vec![(0, 0); n];
                 for w in &wks {
                     if let Some(src) = w.cks.get(cb) {
-                        for &(p, lo, ck) in src {
-                            if !is_c(&cplx, p as usize) {
-                                let q = (p & ((1 << CB) - 1)) as usize;
-                                v[cnt[q] as usize] = (lo, ck);
+                        for &(lo, ck) in src {
+                            let q = ((lo >> PSH) & PLO) as usize;
+                            if !is_c(&cplx, (cb << CB) | q) {
+                                v[cnt[q] as usize] = (lo & !(PLO << PSH), ck);
                                 cnt[q] += 1;
                             }
                         }
