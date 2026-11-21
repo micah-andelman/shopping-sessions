@@ -523,8 +523,35 @@ impl Uf {
     }
 }
 
+/// Set when engine 2 starts writing output (see the panic hook in `run`).
+static WRITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn run(data: &Path, out: &Path) -> bool {
     let t0 = std::time::Instant::now();
+    // Insurance: a panic in engine 2 before any output is written re-executes this binary with
+    // engine 2 off (SS_E2=0), so unexpected data costs time, never a crash. Once writing has
+    // started the panic stays a panic (partial output must not be mixed with a second run's).
+    if std::env::var("SS_E2NOREEXEC").is_err() {
+        std::panic::set_hook(Box::new(|info| {
+            eprintln!("engine2 panic: {}", info);
+            if WRITING.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let args: Vec<std::ffi::CString> = std::env::args_os()
+                .filter_map(|a| std::ffi::CString::new(a.as_bytes().to_vec()).ok())
+                .collect();
+            let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+            argv.push(std::ptr::null());
+            std::env::set_var("SS_E2", "0");
+            let exe = std::ffi::CString::new("/proc/self/exe").unwrap();
+            unsafe { libc::execv(exe.as_ptr(), argv.as_ptr()) };
+            // exec failed: fall through to the default abort
+        }));
+    }
+    if std::env::var("SS_E2PANICTEST").is_ok() {
+        panic!("SS_E2PANICTEST");
+    }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -1426,6 +1453,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // ---------------- write Parquet (as fast::run)
     use super::pq::{self, Col, Kind};
+    WRITING.store(true, std::sync::atomic::Ordering::SeqCst);
     let ud_dir = out.join("user_daily");
     let cd_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
