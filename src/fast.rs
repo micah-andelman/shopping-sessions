@@ -9,7 +9,7 @@
 
 use super::*;
 use std::collections::HashMap;
-use super::scan::{scan, scan2};
+use super::scan::{scan, scan2, scan3, scan3a, Line};
 
 const NB: usize = 256;
 const FB: u64 = 1 << 63;
@@ -566,31 +566,42 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let rounds: usize = std::env::var("SS_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
             let (lines, slow) = (AtomicU64::new(0), AtomicU64::new(0));
             let bytes: usize = ev_chunks.iter().map(|c| c.2 - c.1).sum();
-            for r in 0..rounds * 2 {
-                let new = r % 2 == 1;
+            let names = ["scan", "scan2", "scan3", "scan3a"];
+            for r in 0..rounds * 4 {
+                let which = r % 4;
                 sink.store(0, Relaxed);
                 let t = std::time::Instant::now();
                 ev_chunks.par_iter().for_each(|&(mi, s, e)| {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
                     let mut acc = 0u64;
-                    let mut f = |f: &[Option<&[u8]>; 7]| {
-                        acc = acc.wrapping_mul(31).wrapping_add(1);
-                        for x in f.iter() {
-                            acc = acc.wrapping_add(x.map_or(7, |x| x.len() as u64 ^ (x[0] as u64) << 8 ^ (x[x.len() - 1] as u64) << 16));
+                    macro_rules! body {
+                        ($g:expr) => {{
+                            acc = acc.wrapping_mul(31).wrapping_add(1);
+                            for i in 0..7 {
+                                let x: Option<&[u8]> = $g(i);
+                                acc = acc.wrapping_add(x.map_or(7, |x| x.len() as u64 ^ (x[0] as u64) << 8 ^ (x[x.len() - 1] as u64) << 16));
+                            }
+                        }};
+                    }
+                    match which {
+                        0 => scan::<7>(d, |f| body!(|i: usize| f[i])),
+                        1 => {
+                            scan2::<7>(d, |f| body!(|i: usize| f[i]));
                         }
-                    };
-                    if new {
-                        let st = scan2::<7>(d, &mut f);
-                        if r == 1 {
-                            lines.fetch_add(st.lines, Relaxed);
-                            slow.fetch_add(st.slow, Relaxed);
+                        3 => {
+                            scan3a::<7>(d, |f| body!(|i: usize| f[i]));
                         }
-                    } else {
-                        scan::<7>(d, &mut f);
+                        _ => {
+                            let st = scan3::<7>(d, |f: &Line<7>| body!(|i: usize| f.get(i)));
+                            if r == 2 {
+                                lines.fetch_add(st.lines, Relaxed);
+                                slow.fetch_add(st.slow, Relaxed);
+                            }
+                        }
                     }
                     sink.fetch_add(acc, Relaxed);
                 });
-                eprintln!("scanbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
+                eprintln!("scanbench {} {:.4}s sum {}", names[which], t.elapsed().as_secs_f64(), sink.load(Relaxed));
             }
             eprintln!("scanbench bytes {} lines {} slow {}", bytes, lines.load(Relaxed), slow.load(Relaxed));
             for mode in [0u32, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2] {
@@ -603,8 +614,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 eprintln!("diag mode {} {:.4}s {:?}", mode, t.elapsed().as_secs_f64(), acc.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>());
             }
             // The full event row body (as in the event job below, minus the bucket push) with each scanner.
-            for r in 0..rounds * 2 {
-                let new = r % 2 == 1;
+            for r in 0..rounds * 4 {
+                let which = r % 4;
                 sink.store(0, Relaxed);
                 let t = std::time::Instant::now();
                 ev_chunks.par_iter().for_each(|&(mi, s, e)| {
@@ -612,39 +623,52 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     let mut acc = 0u64;
                     let mut fb = Fb::new();
                     let mut memo = TsMemo::default();
-                    let mut f = |f: &[Option<&'static [u8]>; 7]| {
-                        let eid = match f[0] {
+                    macro_rules! body {
+                        ($g:expr) => {{
+                        let eid = match $g(0) {
                             Some(x) => x,
                             None => return,
                         };
                         let ekey = key_of(eid, &mut fb);
-                        let ing = parse_ts_memo(f[3], &mut memo);
+                        let ing = parse_ts_memo($g(3), &mut memo);
                         let ing = if ing == BAD { i64::MAX } else { ing };
-                        let ts = parse_ts_memo(f[2], &mut memo);
-                        let typ = match f[4] {
+                        let ts = parse_ts_memo($g(2), &mut memo);
+                        let typ = match $g(4) {
                             Some(b"view") => 0u8,
                             Some(b"cart") => 1,
                             Some(b"purchase") => 2,
                             _ => 3,
                         };
-                        let mut ok = typ != 3 && f[1].is_some() && f[5].is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
+                        let mut ok = typ != 3 && $g(1).is_some() && $g(5).is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
                         let mut price = 0u64;
                         if ok && typ == 2 {
-                            let p = parse_price_fast(f[6]);
+                            let p = parse_price_fast($g(6));
                             if p < 0 { ok = false } else { price = p as u64 }
                         }
                         let (ukey, lo) = if ok {
-                            let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
-                            (key_of(f[1].unwrap(), &mut fb), ((ts - ws) as u64) << 33 | price << 9 | cat)
+                            let cat = if typ == 2 { prod.get($g(5).unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
+                            (key_of($g(1).unwrap(), &mut fb), ((ts - ws) as u64) << 33 | price << 9 | cat)
                         } else {
                             (0, NONE)
                         };
                         acc = acc.wrapping_mul(31).wrapping_add(ekey ^ ukey ^ lo ^ ing as u64);
-                    };
-                    if new { scan2::<7>(d, &mut f); } else { scan::<7>(d, &mut f); }
+                    }};
+                    }
+                    match which {
+                        0 => scan::<7>(d, |f| body!(|i: usize| f[i])),
+                        1 => {
+                            scan2::<7>(d, |f| body!(|i: usize| f[i]));
+                        }
+                        3 => {
+                            scan3a::<7>(d, |f| body!(|i: usize| f[i]));
+                        }
+                        _ => {
+                            scan3::<7>(d, |f: &Line<7>| body!(|i: usize| f.get(i)));
+                        }
+                    }
                     sink.fetch_add(acc, Relaxed);
                 });
-                eprintln!("rowbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
+                eprintln!("rowbench {} {:.4}s sum {}", names[which], t.elapsed().as_secs_f64(), sink.load(Relaxed));
             }
             std::process::exit(0);
         }
@@ -868,7 +892,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let d: &'static [u8] = &lk_maps[mi][s..e];
             let mut v = Vec::new();
             let mut fb = Fb::new();
-            scan2::<2>(d, |f| {
+            scan3a::<2>(d, |f| {
                 if let [Some(a), Some(b)] = *f {
                     v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
                 }
@@ -940,7 +964,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
-                    scan2::<7>(d, |f| {
+                    scan3a::<7>(d, |f| {
                         let eid = match f[0] {
                             Some(x) => x,
                             None => return,
@@ -992,7 +1016,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ck_maps[mi][s..e];
-                    scan2::<4>(d, |f| {
+                    scan3a::<4>(d, |f| {
                         let (cid, uid) = match (f[0], f[1]) {
                             (Some(c), Some(u)) => (c, u),
                             _ => return,

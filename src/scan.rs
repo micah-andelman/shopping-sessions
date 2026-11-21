@@ -370,6 +370,196 @@ pub fn scan2_batched<'a, const N: usize>(data: &'a [u8], batch: usize, mut emit:
     st
 }
 
+// ---------------------------------------------------------------------------------------------
+// scan3: scan2 with (1) ALL quote validation done by mask arithmetic in stage 1, so stage 2 reads
+// no bytes to validate a line, and (2) lazy fields: the closure gets a `Line` and cuts only the
+// fields it asks for, straight from the delimiter positions (no array of N slices is built).
+//
+// Quote rules as masks. Let S = delimiters | quotes ("structural" bytes), and call a quote
+// "opening" when the byte before it is a delimiter (or the line start). A line is well-formed iff
+//   V1: the next structural byte after every opening quote is a quote (not a delimiter),
+//   V2: every non-opening quote is the next structural byte after an opening quote,
+//   V3: the byte after every non-opening quote is a delimiter.
+// (Then every field is quote-free or is `"` + quote-free bytes + `"`.) "Next structural byte after
+// an opening quote" is one add: (opening << 1) + !S ripples through the non-structural bytes and
+// lands on the next structural one; the carry continues into the next block.
+// Every violation is recorded at a position p with line_start < p <= line's newline.
+
+/// One well-formed line, fields cut on demand. `get(i)` is the same value `scan` puts in slot i.
+pub struct Line<'a, const N: usize> {
+    lp: *const u8,
+    /// `pos[i]` = offset from `lp` of the delimiter ending field i; `pos[-1] + 1` (wrapping) = line start.
+    pos: *const u32,
+    /// Lines from the exact path carry their fields ready-made (null on the fast path).
+    slow: *const [Option<&'a [u8]>; N],
+}
+
+impl<'a, const N: usize> Line<'a, N> {
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> Option<&'a [u8]> {
+        assert!(i < N);
+        if !self.slow.is_null() {
+            // Safety: set by `slow_line3` to an array that outlives the call.
+            return unsafe { (*self.slow)[i] };
+        }
+        // Safety: scan3 hands out a Line only when pos[-1..N] are valid entries with
+        // s <= e and lp + e inside the input (e is the offset of a real ',' or '\n').
+        unsafe {
+            let s = (*self.pos.add(i).sub(1)).wrapping_add(1) as usize;
+            let e = *self.pos.add(i) as usize;
+            // The line is well-formed: a field that starts with a quote also ends with one and is
+            // at least 2 long. An empty field reads its own delimiter here: not a quote.
+            let q = (*self.lp.add(s) == b'"') as usize;
+            let (a, z) = (s + q, e - q);
+            if a < z { Some(std::slice::from_raw_parts(self.lp.add(a), z - a)) } else { None }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn slow_line3<'a, const N: usize>(line: &'a [u8], emit: &mut impl FnMut(&Line<'a, N>)) {
+    if let Some(f) = crate::fields::<N>(line) {
+        emit(&Line { lp: std::ptr::null(), pos: std::ptr::null(), slow: &f });
+    }
+}
+
+/// Same lines, same order, same field values as `scan` / `scan2`; the closure reads fields with `get`.
+#[inline]
+pub fn scan3<'a, const N: usize>(data: &'a [u8], emit: impl FnMut(&Line<'a, N>)) -> Stats {
+    scan3_batched::<N>(data, BATCH, emit)
+}
+
+/// scan3 with the interface of `scan` / `scan2`: all N fields are cut up front into an array.
+#[inline]
+pub fn scan3a<'a, const N: usize>(data: &'a [u8], mut emit: impl FnMut(&[Option<&'a [u8]>; N])) -> Stats {
+    scan3_batched::<N>(data, BATCH, #[inline(always)] |l: &Line<'a, N>| {
+        if !l.slow.is_null() {
+            // Safety: see `Line::get`.
+            return emit(unsafe { &*l.slow });
+        }
+        let out: [Option<&'a [u8]>; N] = std::array::from_fn(|i| l.get(i));
+        emit(&out)
+    })
+}
+
+/// `batch` must be a positive multiple of 64 (tests use tiny batches to exercise the seams).
+#[inline(always)]
+pub fn scan3_batched<'a, const N: usize>(data: &'a [u8], batch: usize, mut emit: impl FnMut(&Line<'a, N>)) -> Stats {
+    assert!(N >= 1 && batch >= 64 && batch % 64 == 0 && batch <= 1 << 30);
+    let len = data.len();
+    let dp = data.as_ptr();
+    let mut st = Stats::default();
+    // Worst case every byte is a delimiter / newline / violation; + slack for `flatten` and
+    // sentinels; dl has one leading slot (u32::MAX: "+ 1" wraps to offset 0, the first line start).
+    let cap = batch + 64 + 16 + N;
+    let mut dlv: Vec<u32> = vec![0; cap + 1];
+    let mut nl: Vec<u32> = vec![0; cap];
+    let mut bad: Vec<u32> = vec![0; cap];
+    dlv[0] = u32::MAX;
+    let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut base = 0usize; // always the first byte of a line
+    while base < len {
+        let end = (base + batch).min(len);
+        let last = end == len;
+        // ---- stage 1: positions relative to `base`
+        let dl: &mut [u32] = &mut dlv[1..];
+        let (mut nd, mut nn, mut nb) = (0usize, 0usize, 0usize);
+        let mut cd = 1u64; // previous byte is a delimiter (or the line start)
+        let mut cin = 0u64; // an opening quote is still looking for its next structural byte
+        let mut cn = 0u64; // previous byte is a non-opening quote
+        let mut o = base;
+        while o < end {
+            if pf != 0 {
+                prefetch(dp.wrapping_add(o + pf));
+            }
+            let (d, l, q) = if o + 64 <= len {
+                masks3(&data[o..o + 64])
+            } else {
+                let mut tail = [0u8; 64];
+                tail[..len - o].copy_from_slice(&data[o..]);
+                masks3(&tail)
+            };
+            let off = (o - base) as u32;
+            let sm = d | q;
+            let open = q & (d << 1 | cd);
+            let (sum, ov) = (open << 1 | cin).overflowing_add(!sm);
+            let nxt = sum & sm; // next structural byte after each opening quote
+            let nop = q & !open;
+            let mut b = (nxt & d) | (nop & !nxt) | ((nop << 1 | cn) & !d);
+            cin = open >> 63 | ov as u64;
+            cn = nop >> 63;
+            cd = d >> 63;
+            // Safety: nd, nn <= o - base <= batch - 64 here, each call adds at most 64 and may
+            // write 7 slots beyond; cap = batch + 64 + 16 + N.
+            unsafe {
+                flatten::<8>(dl.as_mut_ptr(), &mut nd, d, off);
+                flatten::<2>(nl.as_mut_ptr(), &mut nn, l, off);
+            }
+            while b != 0 {
+                bad[nb] = off + b.trailing_zeros();
+                nb += 1;
+                b &= b - 1;
+            }
+            o += 64;
+        }
+        if nn == 0 {
+            // No complete line in this batch: one line longer than the batch, or the last line.
+            let stop = if last { len } else { memchr::memchr(b'\n', &data[end..]).map_or(len, |p| end + p) };
+            st.lines += 1;
+            st.slow += 1;
+            slow_line3::<N>(&data[base..stop], &mut emit);
+            base = stop + 1;
+            continue;
+        }
+        for i in 0..N {
+            dl[nd + i] = u32::MAX;
+        }
+        bad[nb] = u32::MAX;
+        // ---- stage 2
+        let (mut k, mut bi) = (0usize, 0usize);
+        let mut ls = 0u32;
+        let lp = unsafe { dp.add(base) };
+        let dlp = dl.as_ptr();
+        for j in 0..nn {
+            // Safety (unchecked reads): j < nn; k + N - 1 < nd + N (k never passes the entry of
+            // the current newline, which is < nd); bi <= nb (the sentinel stops it).
+            let le = unsafe { *nl.get_unchecked(j) };
+            let nth = unsafe { *dlp.add(k + N - 1) };
+            let b0 = unsafe { *bad.get_unchecked(bi) };
+            st.lines += 1;
+            if nth == le && b0 > le {
+                // Exactly N-1 commas, then this newline, and no quote violation in the line.
+                // pos[-1] is the previous line's newline (or the leading u32::MAX slot when k = 0).
+                debug_assert!(unsafe { (*dlp.add(k).sub(1)).wrapping_add(1) } == ls && base + (le as usize) < len);
+                emit(&Line { lp, pos: unsafe { dlp.add(k) }, slow: std::ptr::null() });
+                k += N;
+            } else {
+                st.slow += 1;
+                slow_line3::<N>(&data[base + ls as usize..base + le as usize], &mut emit);
+                while bad[bi] <= le {
+                    bi += 1;
+                }
+                while dl[k] != le {
+                    k += 1;
+                }
+                k += 1;
+            }
+            ls = le + 1;
+        }
+        base += ls as usize;
+        if last {
+            if base < len {
+                st.lines += 1;
+                st.slow += 1;
+                slow_line3::<N>(&data[base..], &mut emit);
+            }
+            break;
+        }
+    }
+    st
+}
+
 /// Benchmark helper: parts of stage 1 alone. mode 0 = masks only, 1 = masks + flatten + bad list.
 /// Returns [checksum, blocks, blocks with a quote, blocks with more than 8 delimiters].
 pub fn scan2_diag(data: &[u8], mode: u32) -> [u64; 4] {
@@ -420,7 +610,7 @@ pub fn scan2_diag(data: &[u8], mode: u32) -> [u64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan, scan2, scan2_batched};
+    use super::{scan, scan2, scan2_batched, scan3, scan3_batched, scan3a};
     use crate::{fields, for_lines};
 
     type Rows = Vec<Vec<Option<Vec<u8>>>>;
@@ -440,6 +630,9 @@ mod tests {
         let mut b: Rows = Vec::new();
         scan::<N>(data, |f| b.push(f.iter().map(|x| x.map(|v| v.to_vec())).collect()));
         assert_eq!(a, b, "old scan, N={} input {:?}", N, String::from_utf8_lossy(data));
+        let mut b: Rows = Vec::new();
+        scan3a::<N>(data, |f| b.push(f.iter().map(|x| x.map(|v| v.to_vec())).collect()));
+        assert_eq!(a, b, "scan3a, N={} input {:?}", N, String::from_utf8_lossy(data));
         for batch in [0usize, 64, 128, 192] {
             let mut c: Rows = Vec::new();
             let mut push = |f: &[Option<&[u8]>; N]| {
@@ -456,6 +649,35 @@ mod tests {
                 scan2_batched::<N>(data, batch, &mut push);
             }
             assert_eq!(a, c, "scan2 batch {} N={} input {:?}", batch, N, String::from_utf8_lossy(data));
+            let mut c: Rows = Vec::new();
+            let mut push = |l: &super::Line<N>| {
+                // Read the fields in a scrambled order, each twice: `get` must not depend on order.
+                let mut row: Vec<(usize, Option<&[u8]>)> = Vec::new();
+                for t in 0..N {
+                    let i = (t * 5 + 1) % N;
+                    let x = l.get(i);
+                    assert_eq!(x, l.get(i));
+                    row.push((i, x));
+                }
+                row.sort_by_key(|r| r.0);
+                row.dedup_by_key(|r| r.0);
+                if row.len() != N {
+                    row = (0..N).map(|i| (i, l.get(i))).collect();
+                }
+                for (_, x) in row.iter() {
+                    if let Some(x) = x {
+                        let (p, q) = (x.as_ptr() as usize, data.as_ptr() as usize);
+                        assert!(p >= q && p + x.len() <= q + data.len());
+                    }
+                }
+                c.push(row.iter().map(|r| r.1.map(|v| v.to_vec())).collect())
+            };
+            if batch == 0 {
+                scan3::<N>(data, &mut push);
+            } else {
+                scan3_batched::<N>(data, batch, &mut push);
+            }
+            assert_eq!(a, c, "scan3 batch {} N={} input {:?}", batch, N, String::from_utf8_lossy(data));
         }
     }
 
@@ -704,6 +926,45 @@ mod tests {
             vec![None, Some(b"b\r".to_vec())],
             vec![Some(b"last".to_vec()), Some(b"z".to_vec())],
         ]);
+    }
+
+    #[test]
+    fn clean_input_never_takes_the_slow_path() {
+        // Well-formed lines with quoted fields at every block offset: the exact path would still
+        // give the right rows, so only the counter shows a fast path that has stopped firing.
+        let mut r = Rng(0x7777_1234_abcd_0001);
+        for round in 0..200 {
+            let mut d = Vec::new();
+            let mut lines = 0u64;
+            while d.len() < 3 * super::BATCH {
+                for i in 0..3 {
+                    if i > 0 {
+                        d.push(b',');
+                    }
+                    let l = (r.next() % 9) as usize;
+                    let body = r.fill(b"abc019", l);
+                    if (r.next() + round) % 2 == 0 {
+                        d.push(34);
+                        d.extend(&body);
+                        d.push(34);
+                    } else {
+                        d.extend(&body);
+                    }
+                }
+                d.push(10);
+                lines += 1;
+            }
+            let mut n = 0u64;
+            let st = scan3::<3>(&d, |_| n += 1);
+            assert_eq!((st.lines, st.slow, n), (lines, 0, lines));
+            let mut n = 0u64;
+            let st = scan3a::<3>(&d, |_| n += 1);
+            assert_eq!((st.lines, st.slow, n), (lines, 0, lines));
+            let mut n = 0u64;
+            let st = scan2::<3>(&d, |_| n += 1);
+            assert_eq!((st.lines, st.slow, n), (lines, 0, lines));
+            check::<3>(&d);
+        }
     }
 
     #[test]
