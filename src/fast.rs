@@ -245,9 +245,12 @@ struct Ev {
 /// written ONCE into the person partition of its user key. Dedup then only marks losing
 /// payloads dead in place (lo = NONE); a later pass moves just the rows whose user id maps to
 /// a different person. Dedup rule (identical to the old path): per event id the copy with the
-/// smallest ingest_ts wins; on equal ingest the first copy in (parse group, append) order wins
-/// (equal-ingest copies are identical per the rules); if the winner is invalid the event is
-/// dropped, so every valid loser is killed either way.
+/// smallest ingest_ts wins; if the winner is invalid the event is dropped, so every valid loser
+/// is killed either way. Among copies with EQUAL ingest the choice is arbitrary: at-parse batching
+/// appends the dedup records of maybe-linked copies at batch flush, so append order is not parse
+/// order and depends on when the link table was published. This is safe only because rules.md
+/// guarantees "Copies with equal ingest_ts are identical" (same validity, user and payload).
+/// Do not build anything on dd append order.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DRec {
