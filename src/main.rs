@@ -275,6 +275,123 @@ fn parse_ts_fast(v: Option<&[u8]>) -> i64 {
     parse_ts(Some(v))
 }
 
+/// Per-worker memo of the last valid date seen by parse_ts_memo: most rows share a few dates.
+#[derive(Clone, Copy, Default)]
+struct TsMemo {
+    a: u64,
+    b: u64,
+    days: i64,
+}
+
+/// 8 ASCII digits (little-endian load, first digit lowest) -> value, or None.
+#[inline(always)]
+fn swar8(w: u64) -> Option<i64> {
+    if !swar_ok(w, u64::MAX, 0) {
+        return None;
+    }
+    let w = w ^ 0x3030_3030_3030_3030;
+    let w = (w.wrapping_mul(10).wrapping_add(w >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let w = (w.wrapping_mul(100).wrapping_add(w >> 16)) & 0x0000_FFFF_0000_FFFF;
+    let w = (w.wrapping_mul(10000).wrapping_add(w >> 32)) & 0xFFFF_FFFF;
+    Some(w as i64)
+}
+
+/// parse_ts_fast plus (1) a date memo that skips date decode/validation/days_from_civil when the
+/// YYYY-MM-DD bytes repeat, and (2) an 8-at-a-time path for 13-digit epoch-ms values.
+/// Same results as parse_ts (differential test below).
+#[inline]
+fn parse_ts_memo(v: Option<&[u8]>, memo: &mut TsMemo) -> i64 {
+    let v = match v {
+        Some(v) => v,
+        None => return BAD,
+    };
+    let n = v.len();
+    if n == 20 || n == 25 {
+        let a = u64::from_le_bytes(v[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(v[8..16].try_into().unwrap());
+        const MA: u64 = 0x00FF_FF00_FFFF_FFFF;
+        const SA: u64 = 0x2D00_002D_0000_0000;
+        const MB: u64 = 0xFFFF_00FF_FF00_FFFF;
+        const SB: u64 = 0x0000_3A00_0054_0000;
+        if !swar_ok(a, MA, SA) || !swar_ok(b, MB, SB) || v[16] != b':' {
+            return parse_ts(Some(v));
+        }
+        let (s1, s2) = (v[17].wrapping_sub(b'0'), v[18].wrapping_sub(b'0'));
+        if s1 > 9 || s2 > 9 {
+            return BAD;
+        }
+        let bd = b ^ 0x3030_3030_3030_3030;
+        let by = |w: u64, i: u32| ((w >> (8 * i)) & 0xFF) as i64;
+        let h = by(bd, 3) * 10 + by(bd, 4);
+        let mi = by(bd, 6) * 10 + by(bd, 7);
+        let s = s1 as i64 * 10 + s2 as i64;
+        let off = if n == 20 {
+            if v[19] != b'Z' {
+                return BAD;
+            }
+            0
+        } else {
+            let sign = v[19];
+            if (sign != b'+' && sign != b'-') || v[22] != b':' {
+                return BAD;
+            }
+            let (o1, o2, o3, o4) =
+                (v[20].wrapping_sub(b'0'), v[21].wrapping_sub(b'0'), v[23].wrapping_sub(b'0'), v[24].wrapping_sub(b'0'));
+            if o1 > 9 || o2 > 9 || o3 > 9 || o4 > 9 {
+                return BAD;
+            }
+            let (oh, om) = (o1 as i64 * 10 + o2 as i64, o3 as i64 * 10 + o4 as i64);
+            if oh > 23 || om > 59 {
+                return BAD;
+            }
+            let o = (oh * 60 + om) * 60_000;
+            if sign == b'+' { o } else { -o }
+        };
+        if h > 23 || mi > 59 || s > 59 {
+            return BAD;
+        }
+        let bk = b & 0xFFFF;
+        let days = if a == memo.a && bk == memo.b {
+            memo.days
+        } else {
+            let ad = a ^ 0x3030_3030_3030_3030;
+            let y = by(ad, 0) * 1000 + by(ad, 1) * 100 + by(ad, 2) * 10 + by(ad, 3);
+            let mo = by(ad, 5) * 10 + by(ad, 6);
+            let d = by(bd, 0) * 10 + by(bd, 1);
+            if !(1..=12).contains(&mo) || d < 1 {
+                return BAD;
+            }
+            let md = if mo == 2 {
+                if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 }
+            } else {
+                [31, 0, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize]
+            };
+            if d > md {
+                return BAD;
+            }
+            let days = days_from_civil(y, mo, d);
+            *memo = TsMemo { a, b: bk, days };
+            days
+        };
+        return (days * 86400 + h * 3600 + mi * 60 + s) * 1000 - off;
+    }
+    if n == 13 {
+        let hi = digits_u64(&v[0..5]);
+        let lo = swar8(u64::from_le_bytes(v[5..13].try_into().unwrap()));
+        if let (Some(hi), Some(lo)) = (hi, lo) {
+            return hi * 100_000_000 + lo;
+        }
+        return parse_ts(Some(v));
+    }
+    if n >= 1 && n <= 18 {
+        return match digits_u64(v) {
+            Some(x) => x,
+            None => parse_ts(Some(v)),
+        };
+    }
+    parse_ts(Some(v))
+}
+
 /// Same contract as parse_price.
 #[inline]
 fn parse_price_fast(v: Option<&[u8]>) -> i64 {
@@ -1163,7 +1280,13 @@ mod parse_fast_tests {
             let n = (rng(&mut s) % 27) as usize;
             fixed.push((0..n).map(|_| alphabet[(rng(&mut s) as usize) % alphabet.len()]).collect());
         }
+        let mut memo = TsMemo::default();
+        let mut memo2 = TsMemo::default();
         for v in &fixed {
+            assert_eq!(parse_ts_memo(Some(v), &mut memo), parse_ts(Some(v)), "memo ts {:?}", String::from_utf8_lossy(v));
+            // and with the memo just loaded by a different valid date
+            let _ = parse_ts_memo(Some(b"2026-11-20T00:00:00Z"), &mut memo2);
+            assert_eq!(parse_ts_memo(Some(v), &mut memo2), parse_ts(Some(v)), "memo2 ts {:?}", String::from_utf8_lossy(v));
             assert_eq!(parse_ts_fast(Some(v)), parse_ts(Some(v)), "ts {:?}", String::from_utf8_lossy(v));
             assert_eq!(parse_price_fast(Some(v)), parse_price(Some(v)), "price {:?}", String::from_utf8_lossy(v));
         }

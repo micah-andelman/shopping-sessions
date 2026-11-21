@@ -31,6 +31,18 @@ fn masks(p: &[u8]) -> (u64, u64) {
     }
 }
 
+/// Benchmark helper: only the 64-byte structural mask pass (no bit walk), returns a checksum.
+pub fn masks_only(data: &[u8]) -> u64 {
+    let mut acc = 0u64;
+    let mut base = 0;
+    while base + 64 <= data.len() {
+        let (d, q) = masks(&data[base..base + 64]);
+        acc = acc.wrapping_add((d | q).count_ones() as u64);
+        base += 64;
+    }
+    acc
+}
+
 pub fn scan<'a, const N: usize>(data: &'a [u8], mut emit: impl FnMut(&[Option<&'a [u8]>; N])) {
     let len = data.len();
     let mut out: [Option<&'a [u8]>; N] = [None; N];

@@ -381,6 +381,86 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // Event chunk groups, computed up front so the prefetcher can read ahead in parse order.
     let ev_chunks: &'static [Ch] = Vec::leak(chunks(ev_maps));
     let ev_groups: Vec<&'static [Ch]> = split_groups(ev_chunks, std::env::var("SS_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(nthreads * 8));
+    if std::env::var("SS_PB2").is_ok() {
+        // Stage ablation of the real event parse path (scan::<7> + the ev_job row body), warm data.
+        // Each stage adds one piece; min of 3 runs per stage.
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let use_memo = std::env::var("SS_PB2MEMO").is_ok();
+        let names = ["touch 1B/4KB", "SIMD masks only", "scan walk+fields", "+2x parse_ts", "+2x key_of", "+type/valid/price/cat", "+bucket scatter (full)"];
+        for stage in 0..7 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let sink = AtomicU64::new(0);
+                let t = std::time::Instant::now();
+                ev_groups.par_iter().for_each(|grp| {
+                    let mut acc = 0u64;
+                    let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
+                    let mut bk: Vec<Vec<Ev>> = if stage == 6 { (0..NB).map(|_| Vec::with_capacity(bytes / 64 / NB + 64)).collect() } else { Vec::new() };
+                    let mut fb = Fb::new();
+                    let mut memo = TsMemo::default();
+                    for &(mi, s0, e0) in grp.iter() {
+                        let d: &'static [u8] = &ev_maps[mi][s0..e0];
+                        if stage == 0 {
+                            let mut i = 0;
+                            while i < d.len() { acc += d[i] as u64; i += 4096; }
+                            continue;
+                        }
+                        if stage == 1 {
+                            acc = acc.wrapping_add(super::scan::masks_only(d));
+                            continue;
+                        }
+                        scan::<7>(d, |f| {
+                            if stage == 2 {
+                                acc = acc.wrapping_add(f[0].map_or(0, |x| x.len()) as u64);
+                                return;
+                            }
+                            let (ing, ts) = if use_memo { (parse_ts_memo(f[3], &mut memo), parse_ts_memo(f[2], &mut memo)) } else { (parse_ts_fast(f[3]), parse_ts_fast(f[2])) };
+                            if stage == 3 {
+                                acc = acc.wrapping_add(ing as u64 ^ ts as u64);
+                                return;
+                            }
+                            let ekey = match f[0] { Some(x) => key_of(x, &mut fb), None => 0 };
+                            let uk = match f[1] { Some(x) => key_of(x, &mut fb), None => 0 };
+                            if stage == 4 {
+                                acc = acc.wrapping_add(ing as u64 ^ ts as u64 ^ ekey ^ uk);
+                                return;
+                            }
+                            let ing = if ing == BAD { i64::MAX } else { ing };
+                            let typ = match f[4] {
+                                Some(b"view") => 0u8,
+                                Some(b"cart") => 1,
+                                Some(b"purchase") => 2,
+                                _ => 3,
+                            };
+                            let mut ok = typ != 3 && f[1].is_some() && f[5].is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
+                            let mut price = 0u64;
+                            if ok && typ == 2 {
+                                let pz = parse_price_fast(f[6]);
+                                if pz < 0 { ok = false } else { price = pz as u64 }
+                            }
+                            let lo = if ok {
+                                let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
+                                ((ts - ws) as u64) << 33 | price << 9 | cat
+                            } else {
+                                NONE
+                            };
+                            if stage == 5 {
+                                acc = acc.wrapping_add(ekey ^ uk ^ lo ^ ing as u64);
+                                return;
+                            }
+                            bk[bucket(ekey)].push(Ev { ekey, ukey: if ok { uk } else { 0 }, ing, lo });
+                        });
+                    }
+                    acc = acc.wrapping_add(bk.iter().map(|b| b.len() as u64).sum::<u64>() + fb.len() as u64);
+                    sink.fetch_add(acc, Relaxed);
+                });
+                best = best.min(t.elapsed().as_secs_f64());
+                std::hint::black_box(sink.load(Relaxed));
+            }
+            eprintln!("pb2 stage {} {:<24} {:.3}s", stage, names[stage], best);
+        }
+        std::process::exit(0);
+    }
     if std::env::var("SS_PARSEBENCH").is_ok() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let sink = AtomicU64::new(0);
@@ -594,6 +674,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let cap = bytes / 64 / NB + 64;
                 let mut bk: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
                 let mut fb = Fb::new();
+                let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
                     scan::<7>(d, |f| {
@@ -602,9 +683,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             None => return,
                         };
                         let ekey = key_of(eid, &mut fb);
-                        let ing = parse_ts_fast(f[3]);
+                        let ing = parse_ts_memo(f[3], &mut memo);
                         let ing = if ing == BAD { i64::MAX } else { ing };
-                        let ts = parse_ts_fast(f[2]);
+                        let ts = parse_ts_memo(f[2], &mut memo);
                         let typ = match f[4] {
                             Some(b"view") => 0u8,
                             Some(b"cart") => 1,
@@ -729,6 +810,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
                 let mut raw: Vec<Ck> = Vec::new();
                 let mut fb = Fb::new();
+                let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ck_maps[mi][s..e];
                     scan::<4>(d, |f| {
@@ -736,7 +818,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             (Some(c), Some(u)) => (c, u),
                             _ => return,
                         };
-                        let ts = parse_ts_fast(f[3]);
+                        let ts = parse_ts_memo(f[3], &mut memo);
                         if ts == BAD || ts < cws || ts >= we {
                             return;
                         }
