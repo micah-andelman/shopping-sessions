@@ -193,6 +193,39 @@ struct Ck {
     cid: u64,
 }
 
+/// LSD radix sort of (key, payload) pairs on the low `bits` bits of the key, 11 bits per pass.
+/// Passes whose digit is the same for every record are skipped.
+fn radix_sort(a: &mut Vec<(u64, u64)>, tmp: &mut Vec<(u64, u64)>, bits: u32) {
+    const D: u32 = 11;
+    let n = a.len();
+    tmp.clear();
+    tmp.resize(n, (0, 0));
+    let mut shift = 0u32;
+    while shift < bits {
+        let mut cnt = [0usize; 1 << D];
+        for x in a.iter() {
+            cnt[((x.0 >> shift) & ((1 << D) - 1)) as usize] += 1;
+        }
+        if cnt.iter().any(|&c| c == n) {
+            shift += D;
+            continue;
+        }
+        let mut sum = 0usize;
+        for c in cnt.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for x in a.iter() {
+            let d = ((x.0 >> shift) & ((1 << D) - 1)) as usize;
+            tmp[cnt[d]] = *x;
+            cnt[d] += 1;
+        }
+        std::mem::swap(a, tmp);
+        shift += D;
+    }
+}
+
 /// Open-addressing id key -> person key table (linear probing, 16-byte slots, key 0 = empty:
 /// no real key is 0). Separate from hashbrown so lookups can be prefetched a batch ahead.
 struct LinkTab {
@@ -852,35 +885,91 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 touched: Vec::new(),
             };
             let mut ek: Vec<(u64, u64)> = Vec::new();
+            let mut tmp: Vec<(u64, u64)> = Vec::new();
             let mut ck: Vec<Ck> = Vec::new();
+            let mut ids: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::new();
+            let mut keys: Vec<u64> = Vec::new();
+            let use_radix = std::env::var("SS_NORADIX").is_err();
             for p in (gi * NP / ngr)..((gi + 1) * NP / ngr) {
                 ek.clear();
                 ck.clear();
+                if !use_radix {
+                    for g in &eparts {
+                        ek.extend_from_slice(&g[p]);
+                    }
+                    for g in &cparts {
+                        ck.extend_from_slice(&g[p]);
+                    }
+                    ek.sort_unstable();
+                    ck.sort_unstable_by_key(|c| (c.pkey, c.lo));
+                    let n = ek.len();
+                    let (mut ci, mut i) = (0usize, 0usize);
+                    while i < n {
+                        let key = ek[i].0;
+                        let mut j = i + 1;
+                        while j < n && ek[j].0 == key {
+                            j += 1;
+                        }
+                        while ci < ck.len() && ck[ci].pkey < key {
+                            ci += 1;
+                        }
+                        let c0 = ci;
+                        while ci < ck.len() && ck[ci].pkey == key {
+                            ci += 1;
+                        }
+                        do_person(key, &ek[i..j], &ck[c0..ci], &mut acc, &mut rows);
+                        i = j;
+                    }
+                    continue;
+                }
+                // Dense person numbers for this partition, then an LSD radix sort on
+                // (number << 31 | ts) instead of a comparison sort of (person key, payload).
+                ids.clear();
+                keys.clear();
                 for g in &eparts {
-                    ek.extend_from_slice(&g[p]);
+                    for &(pk, lo) in &g[p] {
+                        let h = mix(pk);
+                        let id = match ids.find(h, |e| e.0 == pk) {
+                            Some(e) => e.1,
+                            None => {
+                                let id = keys.len() as u32;
+                                ids.insert_unique(h, (pk, id), |e| mix(e.0));
+                                keys.push(pk);
+                                id
+                            }
+                        };
+                        ek.push(((id as u64) << 31 | lo >> 33, lo));
+                    }
                 }
-                for g in &cparts {
-                    ck.extend_from_slice(&g[p]);
-                }
-                ek.sort_unstable();
-                ck.sort_unstable_by_key(|c| (c.pkey, c.lo));
                 let n = ek.len();
-                let mut ci = 0usize;
-                let mut i = 0usize;
+                if n == 0 {
+                    continue;
+                }
+                let idbits = 64 - (keys.len() as u64).leading_zeros();
+                radix_sort(&mut ek, &mut tmp, 31 + idbits);
+                for g in &cparts {
+                    for c in &g[p] {
+                        if let Some(e) = ids.find(mix(c.pkey), |e| e.0 == c.pkey) {
+                            ck.push(Ck { pkey: e.1 as u64, ..*c });
+                        }
+                    }
+                }
+                ck.sort_unstable_by_key(|c| (c.pkey, c.lo));
+                let (mut ci, mut i) = (0usize, 0usize);
                 while i < n {
-                    let key = ek[i].0;
+                    let id = ek[i].0 >> 31;
                     let mut j = i + 1;
-                    while j < n && ek[j].0 == key {
+                    while j < n && ek[j].0 >> 31 == id {
                         j += 1;
                     }
-                    while ci < ck.len() && ck[ci].pkey < key {
+                    while ci < ck.len() && ck[ci].pkey < id {
                         ci += 1;
                     }
                     let c0 = ci;
-                    while ci < ck.len() && ck[ci].pkey == key {
+                    while ci < ck.len() && ck[ci].pkey == id {
                         ci += 1;
                     }
-                    do_person(key, &ek[i..j], &ck[c0..ci], &mut acc, &mut rows);
+                    do_person(keys[id as usize], &ek[i..j], &ck[c0..ci], &mut acc, &mut rows);
                     i = j;
                 }
             }
