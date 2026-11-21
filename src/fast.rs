@@ -967,7 +967,42 @@ pub fn run(data: &Path, out: &Path) -> bool {
         r
     };
 
-    let (links, evp) = rayon::join(link_job, ev_job);
+    // Clicks don't need the link table until the person lookup, so their parse runs here,
+    // beside the events (SS_CKLATE=1 restores the old order: parse after links+events).
+    let ck_parse = || -> Vec<(Vec<Ck>, Fb)> {
+        let ch = chunks(ck_maps);
+        let groups = split_groups(&ch, nthreads * 2);
+        groups
+            .par_iter()
+            .map(|grp| {
+                let mut raw: Vec<Ck> = Vec::new();
+                let mut fb = Fb::new();
+                let mut memo = TsMemo::default();
+                for &(mi, s, e) in grp.iter() {
+                    let d: &'static [u8] = &ck_maps[mi][s..e];
+                    scan2::<4>(d, |f| {
+                        let (cid, uid) = match (f[0], f[1]) {
+                            (Some(c), Some(u)) => (c, u),
+                            _ => return,
+                        };
+                        let ts = parse_ts_memo(f[3], &mut memo);
+                        if ts == BAD || ts < cws || ts >= we {
+                            return;
+                        }
+                        let camp = match f[2].and_then(|c| camp_map.get(c)) {
+                            Some(c) => c,
+                            None => return,
+                        };
+                        // pkey holds the user key until the batched person lookup
+                        raw.push(Ck { pkey: key_of(uid, &mut fb), lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
+                    });
+                }
+                (raw, fb)
+            })
+            .collect()
+    };
+    let ck_early = std::env::var("SS_CKLATE").is_err();
+    let (links, (evp, ck_raw)) = rayon::join(link_job, || rayon::join(ev_job, || if ck_early { Some(ck_parse()) } else { None }));
     let (ltab, lfb) = match links {
         Some(x) => x,
         None => return false,
@@ -1053,34 +1088,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // ---------------- clicks (no dedup needed: copies are identical), scattered by person
     let ck_job = || -> (Vec<Vec<Vec<Ck>>>, Fb) {
-        let ch = chunks(ck_maps);
-        let groups = split_groups(&ch, nthreads * 2);
-        let parts: Vec<(Vec<Vec<Ck>>, Fb)> = groups
-            .par_iter()
-            .map(|grp| {
+        let raws: Vec<(Vec<Ck>, Fb)> = match ck_raw {
+            Some(r) => r,
+            None => ck_parse(),
+        };
+        let parts: Vec<(Vec<Vec<Ck>>, Fb)> = raws
+            .into_par_iter()
+            .map(|(raw, fb)| {
                 let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
-                let mut raw: Vec<Ck> = Vec::new();
-                let mut fb = Fb::new();
-                let mut memo = TsMemo::default();
-                for &(mi, s, e) in grp.iter() {
-                    let d: &'static [u8] = &ck_maps[mi][s..e];
-                    scan2::<4>(d, |f| {
-                        let (cid, uid) = match (f[0], f[1]) {
-                            (Some(c), Some(u)) => (c, u),
-                            _ => return,
-                        };
-                        let ts = parse_ts_memo(f[3], &mut memo);
-                        if ts == BAD || ts < cws || ts >= we {
-                            return;
-                        }
-                        let camp = match f[2].and_then(|c| camp_map.get(c)) {
-                            Some(c) => c,
-                            None => return,
-                        };
-                        // pkey holds the user key until the batched person lookup below
-                        raw.push(Ck { pkey: key_of(uid, &mut fb), lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
-                    });
-                }
                 let mut ks: Vec<u64> = raw.iter().map(|c| c.pkey).collect();
                 ltab.resolve_all(&mut ks);
                 for (c, &pk) in raw.iter().zip(ks.iter()) {
