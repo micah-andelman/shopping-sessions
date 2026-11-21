@@ -242,6 +242,48 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let nthreads = rayon::current_num_threads().max(1);
     lap("opened");
 
+    // Event chunk groups, computed up front so the prefetcher can read ahead in parse order.
+    let ev_chunks: &'static [Ch] = Vec::leak(chunks(ev_maps));
+    let ev_groups: Vec<&'static [Ch]> = split_groups(ev_chunks, std::env::var("SS_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(nthreads));
+    // Cold-cache I/O overlap: background threads ask the kernel for every input window
+    // (links, then events interleaved across parse groups, then clicks) so reads run ahead of parsing.
+    if std::env::var("SS_NOPREFETCH").is_err() {
+        let mut wins: Vec<(&'static Mmap, usize, usize)> = Vec::new();
+        const W: usize = 4 << 20;
+        let whole = |maps: &'static [Mmap], wins: &mut Vec<(&'static Mmap, usize, usize)>| {
+            for m in maps {
+                let mut s = 0;
+                while s < m.len() {
+                    let e = (s + W).min(m.len());
+                    wins.push((m, s, e));
+                    s = e;
+                }
+            }
+        };
+        whole(lk_maps, &mut wins);
+        let rounds = ev_groups.iter().map(|g| g.len()).max().unwrap_or(0);
+        for r in 0..rounds {
+            for g in &ev_groups {
+                if let Some(&(mi, s, e)) = g.get(r) {
+                    wins.push((&ev_maps[mi], s, e));
+                }
+            }
+        }
+        whole(ck_maps, &mut wins);
+        let wins: &'static [(&'static Mmap, usize, usize)] = Vec::leak(wins);
+        const LANES: usize = 4;
+        for lane in 0..LANES {
+            std::thread::spawn(move || {
+                for (i, &(m, s, e)) in wins.iter().enumerate() {
+                    if i % LANES == lane {
+                        let s0 = s & !4095;
+                        let _ = m.advise_range(memmap2::Advice::WillNeed, s0, e - s0);
+                    }
+                }
+            });
+        }
+    }
+
     // ---------------- links -> table: id key -> person key (root = byte-wise smallest id)
     let link_job = || -> Option<(hashbrown::HashTable<(u64, u64)>, Fb)> {
         let lk_chunks = chunks(lk_maps);
@@ -307,9 +349,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // ---------------- events: parse every copy, scatter by event_id bucket
     let ev_job = || -> Vec<(Vec<Vec<Ev>>, Fb)> {
-        let ch = chunks(ev_maps);
-        let groups = split_groups(&ch, nthreads * 4);
-        groups
+        ev_groups
             .par_iter()
             .map(|grp| {
                 let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
