@@ -24,4 +24,5 @@ parallel small-table load with small link chunks.
 
 Headline arm from 2:00 AM on: 8 threads on 4 physical cores (cores 0-7), warm, plus total CPU-seconds.
 Windows differ in load, so compare only rows measured in the same window.
+| v5.12 | 04069bb | scorer-like idle 0.391 s (cpu 2.77), +1 hog 0.525 s; 8fd1206 same window 0.461 / 0.668 | 60M = golden | 1.04 s | + 32-entry date table, write-combining scatter (c45), one-table link tail + column-direct output (auditor) |
 
