@@ -142,7 +142,7 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut emit: impl FnMut(&[Option<&'
 // reference `fields` (exact, slow), as is a last line without '\n' and a line longer than a batch.
 
 /// Input bytes per batch (multiple of 64). Position buffers for one batch stay in L1/L2.
-pub const BATCH: usize = 16 * 1024;
+pub const BATCH: usize = 8 * 1024;
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stats {
@@ -495,7 +495,7 @@ mod tests {
         }
         // Random, every length 0..=200 (and around the block and batch seams).
         let mut r = Rng(0xdead_beef_cafe_f00d);
-        for len in (0..=200usize).chain(250..=262).chain(16376..=16392) {
+        for len in (0..=200usize).chain(250..=262).chain(super::BATCH - 8..=super::BATCH + 8) {
             let reps = if len > 300 { 6 } else { 400 };
             for _ in 0..reps {
                 let d = r.fill(alpha, len);

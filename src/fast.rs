@@ -551,6 +551,49 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 eprintln!("scanbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
             }
             eprintln!("scanbench bytes {} lines {} slow {}", bytes, lines.load(Relaxed), slow.load(Relaxed));
+            // The full event row body (as in the event job below, minus the bucket push) with each scanner.
+            for r in 0..rounds * 2 {
+                let new = r % 2 == 1;
+                sink.store(0, Relaxed);
+                let t = std::time::Instant::now();
+                ev_chunks.par_iter().for_each(|&(mi, s, e)| {
+                    let d: &'static [u8] = &ev_maps[mi][s..e];
+                    let mut acc = 0u64;
+                    let mut fb = Fb::new();
+                    let mut f = |f: &[Option<&'static [u8]>; 7]| {
+                        let eid = match f[0] {
+                            Some(x) => x,
+                            None => return,
+                        };
+                        let ekey = key_of(eid, &mut fb);
+                        let ing = parse_ts_fast(f[3]);
+                        let ing = if ing == BAD { i64::MAX } else { ing };
+                        let ts = parse_ts_fast(f[2]);
+                        let typ = match f[4] {
+                            Some(b"view") => 0u8,
+                            Some(b"cart") => 1,
+                            Some(b"purchase") => 2,
+                            _ => 3,
+                        };
+                        let mut ok = typ != 3 && f[1].is_some() && f[5].is_some() && ts != BAD && ts >= ws && ts < we && ing - ts <= DAY;
+                        let mut price = 0u64;
+                        if ok && typ == 2 {
+                            let p = parse_price_fast(f[6]);
+                            if p < 0 { ok = false } else { price = p as u64 }
+                        }
+                        let (ukey, lo) = if ok {
+                            let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
+                            (key_of(f[1].unwrap(), &mut fb), ((ts - ws) as u64) << 33 | price << 9 | cat)
+                        } else {
+                            (0, NONE)
+                        };
+                        acc = acc.wrapping_mul(31).wrapping_add(ekey ^ ukey ^ lo ^ ing as u64);
+                    };
+                    if new { scan2::<7>(d, &mut f); } else { scan::<7>(d, &mut f); }
+                    sink.fetch_add(acc, Relaxed);
+                });
+                eprintln!("rowbench {} {:.4}s sum {}", if new { "new" } else { "old" }, t.elapsed().as_secs_f64(), sink.load(Relaxed));
+            }
             std::process::exit(0);
         }
         for stage in 0..6 {
