@@ -251,6 +251,31 @@ impl Wc4 {
     }
 }
 
+/// Survivors of one dedup bucket in index order: word 0 per event, plus one (person, start)
+/// header per run of one person.
+#[derive(Default)]
+struct Sv {
+    w: Vec<u64>,
+    runs: Vec<(u32, u32)>,
+}
+impl Sv {
+    #[inline(always)]
+    fn push(&mut self, p: u32, w0: u64) {
+        if self.runs.last().map_or(true, |r| r.0 != p) {
+            self.runs.push((p, self.w.len() as u32));
+        }
+        self.w.push(w0);
+    }
+    /// (person, start, end) of every run
+    fn each(&self) -> impl Iterator<Item = (u32, usize, usize)> + '_ {
+        let n = self.runs.len();
+        (0..n).map(move |i| {
+            let e = if i + 1 < n { self.runs[i + 1].1 as usize } else { self.w.len() };
+            (self.runs[i].0, self.runs[i].1 as usize, e)
+        })
+    }
+}
+
 struct Wk {
     /// Event records per index bucket. UnsafeCell: the dedup worker that owns bucket b frees
     /// its vectors as soon as the bucket is done (each bucket has exactly one owner).
@@ -913,7 +938,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
 
     // ---------------- odd event ids: exact dedup (rare)
-    let route = |w0: u64, w1: u64, simple: &mut Vec<(u32, u64)>, cx: &mut Vec<(u64, u64)>| {
+    let route = |w0: u64, w1: u64, simple: &mut Sv, cx: &mut Vec<(u64, u64)>| {
         let alias = w0 & 15;
         let pid = w1 >> 36;
         if alias == 15 {
@@ -922,10 +947,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
         } else if is_c(&cplx, pid as usize) {
             cx.push((node_s(pid as u32, alias as u32), w0));
         } else {
-            simple.push((pid as u32, w0));
+            simple.push(pid as u32, w0);
         }
     };
-    let mut odd_simple: Vec<(u32, u64)> = Vec::new();
+    let mut odd_simple = Sv::default();
     let mut odd_cx: Vec<(u64, u64)> = Vec::new();
     {
         let mut m: HashMap<u64, [u64; 2]> = HashMap::new();
@@ -952,27 +977,20 @@ pub fn run(data: &Path, out: &Path) -> bool {
 
     // ---------------- dedup per index bucket: direct slot array, smallest ingest wins
     let ecnt: Vec<AtomicU32> = (0..np + 1).map(|_| AtomicU32::new(0)).collect();
-    let count_runs = |v: &[(u32, u64)], cnt: &[AtomicU32]| {
-        let mut i = 0;
-        while i < v.len() {
-            let p = v[i].0;
-            let mut j = i + 1;
-            while j < v.len() && v[j].0 == p {
-                j += 1;
-            }
-            cnt[p as usize].fetch_add((j - i) as u32, Relaxed);
-            i = j;
+    let count_runs = |v: &Sv, cnt: &[AtomicU32]| {
+        for (p, a, b) in v.each() {
+            cnt[p as usize].fetch_add((b - a) as u32, Relaxed);
         }
     };
     count_runs(&odd_simple, &ecnt);
     let nextb = AtomicUsize::new(0);
-    let dedup = || -> Vec<(Vec<Vec<(u32, u64)>>, Vec<(u64, u64)>)> { (0..nthreads)
+    let dedup = || -> Vec<(Vec<Sv>, Vec<(u64, u64)>)> { (0..nthreads)
         .into_par_iter()
         .map(|_| {
             let mut win = vec![[0u64; 2]; BSZ];
             let mut gen = vec![0u32; BSZ];
             let mut cur = 0u32;
-            let mut outs: Vec<Vec<(u32, u64)>> = Vec::new();
+            let mut outs: Vec<Sv> = Vec::new();
             let mut cx: Vec<(u64, u64)> = Vec::new();
             loop {
                 let b = nextb.fetch_add(1, Relaxed);
@@ -994,7 +1012,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         }
                     }
                 }
-                let mut simple: Vec<(u32, u64)> = Vec::with_capacity(n);
+                let mut simple = Sv { w: Vec::with_capacity(n), runs: Vec::with_capacity(n / 16 + 16) };
                 for s in 0..BSZ {
                     if gen[s] == cur && win[s][0] != NONE {
                         route(win[s][0], win[s][1], &mut simple, &mut cx);
@@ -1160,11 +1178,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
             }
         }
     };
-    let mut streams: Vec<&[(u32, u64)]> = vec![&odd_simple[..]];
+    let mut streams: Vec<&Sv> = vec![&odd_simple];
     for (o, _) in &dd {
-        streams.extend(o.iter().map(|v| &v[..]));
+        streams.extend(o.iter());
     }
-    let ne: usize = streams.iter().map(|v| v.len()).sum();
+    let ne: usize = streams.iter().map(|v| v.w.len()).sum();
     let est_out = ne / nthreads / 6 + 1024;
     let nextt = AtomicUsize::new(0);
     let new_bufs = || Bufs { name: Vec::with_capacity(16), tmp: Vec::with_capacity(16), evs: Vec::new(), cks: Vec::new() };
@@ -1184,24 +1202,20 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     break;
                 }
                 let v = streams[si];
-                let mut i = 0;
-                while i < v.len() {
-                    let p = v[i].0;
-                    let mut j = i + 1;
-                    while j < v.len() && v[j].0 == p {
-                        j += 1;
-                    }
+                for (p, i, j) in v.each() {
                     if ecnt[p as usize].load(Relaxed) as usize == j - i {
-                        run.clear();
-                        run.extend(v[i..j].iter().map(|x| x.1));
-                        if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                        let ev = &v.w[i..j];
+                        if ev.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                            run.clear();
+                            run.extend_from_slice(ev);
                             run.sort_unstable();
+                            person(p as usize, &run, &mut acc, &mut rows, &mut bf);
+                        } else {
+                            person(p as usize, ev, &mut acc, &mut rows, &mut bf);
                         }
-                        person(p as usize, &run, &mut acc, &mut rows, &mut bf);
                     } else {
                         split.push((p, si as u32, i as u32, j as u32));
                     }
-                    i = j;
                 }
             }
             (rows, acc.camp, split)
@@ -1243,7 +1257,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let (i, j, _) = groups[gi];
                 run.clear();
                 for &(_, si, a, b) in &split[i..j] {
-                    run.extend(streams[si as usize][a as usize..b as usize].iter().map(|x| x.1));
+                    run.extend_from_slice(&streams[si as usize].w[a as usize..b as usize]);
                 }
                 if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
                     run.sort_unstable();
