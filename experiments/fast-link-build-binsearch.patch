@@ -1,0 +1,72 @@
+diff --git a/src/fast.rs b/src/fast.rs
+index 7526008..efbca68 100644
+--- a/src/fast.rs
++++ b/src/fast.rs
+@@ -494,11 +494,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
+         if !fbm.is_empty() {
+             lids.sort_by(|&a, &b| cmp_id(a, b, &fbm));
+         }
+-        let mut idx: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::with_capacity(lids.len());
+-        for (i, &k) in lids.iter().enumerate() {
+-            idx.insert_unique(th(k), (k, i as u32), |e| th(e.0));
+-        }
+-        let get = |k: u64| idx.find(th(k), |e| e.0 == k).unwrap().1;
++        // Endpoint indices by parallel binary search over the sorted ids (index order = byte order).
++        let cmp = |x: u64, k: u64| if fbm.is_empty() { x.cmp(&k) } else { cmp_id(x, k, &fbm) };
++        let pos = |k: u64| lids.binary_search_by(|&x| cmp(x, k)).unwrap() as u32;
++        let pairs: Vec<(u32, u32)> = parts.par_iter().flat_map_iter(|(v, _)| v.iter().map(|&(a, b)| (pos(a), pos(b)))).collect();
+         let mut parent: Vec<u32> = (0..lids.len() as u32).collect();
+         fn find(p: &mut [u32], mut x: u32) -> u32 {
+             while p[x as usize] != x {
+@@ -508,21 +507,28 @@ pub fn run(data: &Path, out: &Path) -> bool {
+             }
+             x
+         }
+-        for (v, _) in &parts {
+-            for &(a, b) in v {
+-                let ra = find(&mut parent, get(a));
+-                let rb = find(&mut parent, get(b));
+-                if ra != rb {
+-                    if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
+-                }
++        for &(a, b) in &pairs {
++            let ra = find(&mut parent, a);
++            let rb = find(&mut parent, b);
++            if ra != rb {
++                // smaller index = byte-wise smaller id becomes the root
++                if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
+             }
+         }
+-        let mut table = LinkTab::new(lids.len());
+-        for i in 0..lids.len() as u32 {
++        for i in 0..parent.len() as u32 {
+             let r = find(&mut parent, i);
+-            table.insert(lids[i as usize], lids[r as usize]);
++            parent[i as usize] = r;
++        }
++        // Only ids whose person is another id go in the table; a missing key maps to itself.
++        let moved = parent.iter().enumerate().filter(|&(i, &r)| r as usize != i).count();
++        let mut table = LinkTab::new(moved);
++        for (i, &r) in parent.iter().enumerate() {
++            if r as usize != i {
++                table.insert(lids[i], lids[r as usize]);
++            }
+         }
+         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
++        lap("  link table built");
+         Some((table, fb))
+     };
+ 
+@@ -574,7 +580,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
+             .collect()
+     };
+ 
+-    let (links, evp) = rayon::join(link_job, ev_job);
++    let (links, evp) = rayon::join(link_job, || {
++        let r = ev_job();
++        lap("  events parsed");
++        r
++    });
+     let (ltab, lfb) = match links {
+         Some(x) => x,
+         None => return false,
