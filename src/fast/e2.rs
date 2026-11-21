@@ -686,7 +686,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         jobs.push((2, c.0, c.1, c.2));
     }
     let est_rows = ev_bytes / 80;
-    let bcap = (est_rows as f64 * 1.08 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
+    let bcap = (est_rows as f64 * 1.25 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
     // clicks per (worker, person bucket), generously: ~25 events per person, lines >= 36 bytes
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     let ccap = ck_bytes / 36 / ((est_rows / 25 >> CB) + 1) / nthreads * 2 + 64;
