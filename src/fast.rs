@@ -175,6 +175,72 @@ struct Ck {
     cid: u64,
 }
 
+/// Open-addressing id key -> person key table (linear probing, 16-byte slots, key 0 = empty:
+/// no real key is 0). Separate from hashbrown so lookups can be prefetched a batch ahead.
+struct LinkTab {
+    mask: usize,
+    slots: Vec<[u64; 2]>,
+    n: usize,
+}
+impl LinkTab {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2).max(16).next_power_of_two();
+        LinkTab { mask: cap - 1, slots: vec![[0u64; 2]; cap], n: 0 }
+    }
+    #[inline]
+    fn home(&self, k: u64) -> usize {
+        mix(k) as usize & self.mask
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let mut i = self.home(k);
+        while self.slots[i][0] != 0 {
+            if self.slots[i][0] == k {
+                self.slots[i][1] = v;
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+        self.slots[i] = [k, v];
+        self.n += 1;
+    }
+    /// Person key of an id key (itself when unlinked).
+    #[inline]
+    fn get(&self, k: u64) -> u64 {
+        let mut i = self.home(k);
+        loop {
+            let s = self.slots[i];
+            if s[0] == k {
+                return s[1];
+            }
+            if s[0] == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.slots.as_ptr().add(self.home(k)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    /// Resolve keys in place, prefetching DIST lookups ahead.
+    fn resolve_all(&self, ks: &mut [u64]) {
+        const DIST: usize = 16;
+        for i in 0..ks.len().min(DIST) {
+            self.prefetch(ks[i]);
+        }
+        for i in 0..ks.len() {
+            if i + DIST < ks.len() {
+                self.prefetch(ks[i + DIST]);
+            }
+            ks[i] = self.get(ks[i]);
+        }
+    }
+}
+
 pub fn run(data: &Path, out: &Path) -> bool {
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("SS_VERBOSE").is_ok();
@@ -381,7 +447,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     }
 
     // ---------------- links -> table: id key -> person key (root = byte-wise smallest id)
-    let link_job = || -> Option<(hashbrown::HashTable<(u64, u64)>, Fb)> {
+    let link_job = || -> Option<(LinkTab, Fb)> {
         let lk_chunks = chunks(lk_maps);
         let parts: Vec<(Vec<(u64, u64)>, Fb)> = lk_chunks
             .par_iter()
@@ -433,11 +499,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 }
             }
         }
-        let mut table: hashbrown::HashTable<(u64, u64)> = hashbrown::HashTable::with_capacity(lids.len());
+        let mut table = LinkTab::new(lids.len());
         for i in 0..lids.len() as u32 {
             let r = find(&mut parent, i);
-            let k = lids[i as usize];
-            table.insert_unique(th(k), (k, lids[r as usize]), |e| th(e.0));
+            table.insert(lids[i as usize], lids[r as usize]);
         }
         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
         Some((table, fb))
@@ -494,13 +559,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
         Some(x) => x,
         None => return false,
     };
-    lap(&format!("links ({} ids) and events parsed", ltab.len()));
-    let person = |u: u64| -> u64 {
-        match ltab.find(th(u), |e| e.0 == u) {
-            Some(e) => e.1,
-            None => u,
-        }
-    };
+    lap(&format!("links ({} ids) and events parsed", ltab.n));
 
     // Person partitions: survivors and clicks are scattered by hash(person key) so each
     // partition is sorted on its own, in cache, instead of one global sort.
@@ -517,13 +576,39 @@ pub fn run(data: &Path, out: &Path) -> bool {
             .map(|gi| {
                 let mut outp: Vec<Vec<(u64, u64)>> = (0..NP).map(|_| Vec::new()).collect();
                 let mut t: hashbrown::HashTable<Ev> = hashbrown::HashTable::new();
+                let (mut ks, mut los): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+                const FBITS: usize = 1 << 20;
+                const FMASK: usize = FBITS - 1;
+                let mut seen = vec![0u64; FBITS / 64];
+                let mut dup = vec![0u64; FBITS / 64];
                 for b in (gi * NB / ng)..((gi + 1) * NB / ng) {
-                    let n: usize = evp.iter().map(|g| g.0[b].len()).sum();
+                    // Prepass: a bit filter over event-id hashes finds ids that may occur more
+                    // than once (2-4% real repeats plus filter collisions). Only those copies go
+                    // through the exact dedup table; every other copy is its event's only copy.
+                    seen.fill(0);
+                    dup.fill(0);
+                    for g in &evp {
+                        for e in &g.0[b] {
+                            let h = th(e.ekey) as usize & FMASK;
+                            let (w, m) = (h >> 6, 1u64 << (h & 63));
+                            dup[w] |= seen[w] & m;
+                            seen[w] |= m;
+                        }
+                    }
+                    ks.clear();
+                    los.clear();
                     t.clear();
-                    t.reserve(n, |x| th(x.ekey));
                     for g in &evp {
                         for e in &g.0[b] {
                             let h = th(e.ekey);
+                            let f = h as usize & FMASK;
+                            if dup[f >> 6] & (1u64 << (f & 63)) == 0 {
+                                if e.lo != NONE {
+                                    ks.push(e.ukey);
+                                    los.push(e.lo);
+                                }
+                                continue;
+                            }
                             match t.find_mut(h, |x| x.ekey == e.ekey) {
                                 Some(x) => {
                                     if e.ing < x.ing {
@@ -536,11 +621,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             }
                         }
                     }
+                    // survivors: resolve persons in a batch with prefetch, then scatter
                     for e in t.iter() {
                         if e.lo != NONE {
-                            let pk = person(e.ukey);
-                            outp[ppart(pk)].push((pk, e.lo));
+                            ks.push(e.ukey);
+                            los.push(e.lo);
                         }
+                    }
+                    ltab.resolve_all(&mut ks);
+                    for (&pk, &lo) in ks.iter().zip(los.iter()) {
+                        outp[ppart(pk)].push((pk, lo));
                     }
                 }
                 outp
@@ -556,6 +646,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             .par_iter()
             .map(|grp| {
                 let mut outp: Vec<Vec<Ck>> = (0..NP).map(|_| Vec::new()).collect();
+                let mut raw: Vec<Ck> = Vec::new();
                 let mut fb = Fb::new();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ck_maps[mi][s..e];
@@ -572,9 +663,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             Some(c) => c,
                             None => return,
                         };
-                        let pkey = person(key_of(uid, &mut fb));
-                        outp[ppart(pkey)].push(Ck { pkey, lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
+                        // pkey holds the user key until the batched person lookup below
+                        raw.push(Ck { pkey: key_of(uid, &mut fb), lo: ((ts - cws) as u64) << 32 | camp as u64, cid: key_of(cid, &mut fb) });
                     });
+                }
+                let mut ks: Vec<u64> = raw.iter().map(|c| c.pkey).collect();
+                ltab.resolve_all(&mut ks);
+                for (c, &pk) in raw.iter().zip(ks.iter()) {
+                    outp[ppart(pk)].push(Ck { pkey: pk, ..*c });
                 }
                 (outp, fb)
             })
