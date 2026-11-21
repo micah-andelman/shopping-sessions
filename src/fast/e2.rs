@@ -120,6 +120,17 @@ fn user(b: &[u8], ku: u64, pb: u64) -> Option<(u32, u32)> {
     let (p, a) = (v >> 9, v & 511);
     if a < NALIAS && p < pb { Some((p as u32, a as u32)) } else { None }
 }
+/// Sort key with the byte order of base-36 strings: the digits left-aligned to 8 places, then the
+/// length (a string that is a prefix of another sorts first).
+const P36: [u64; 9] = [1, 36, 1296, 46656, 1679616, 60466176, 2176782336, 78364164096, 2821109907456];
+#[inline]
+fn name_key(w: u64) -> (u64, u8) {
+    let mut len = 1usize;
+    while len < 8 && w >= P36[len] {
+        len += 1;
+    }
+    (w * P36[8 - len], len as u8)
+}
 fn user_name(p: u32, a: u32, ku: u64, out: &mut Vec<u8>) {
     enc_into(b'u', scramble((p as u64) << 9 | a as u64, ku), out);
 }
@@ -1123,8 +1134,14 @@ pub fn run(data: &Path, out: &Path) -> bool {
         evs: Vec<u64>,
         cks: Vec<(u64, u64)>,
     }
+    // SS_E2PABL=1 (diagnostic): skip the per-person work (classes, names, sessions).
+    let pabl: u32 = std::env::var("SS_E2PABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     // One person: `ev` sorted by time.
     let person = |p: usize, ev: &[u64], acc: &mut Acc, rows: &mut UserOut, bf: &mut Bufs| {
+        if pabl == 1 {
+            acc.cnt[0] = acc.cnt[0].wrapping_add(ev.len() as u32);
+            return;
+        }
         let g = &cgrp[p >> CB];
         let ck: &[(u64, u64)] = if g.1.is_empty() {
             &[]
@@ -1133,25 +1150,37 @@ pub fn run(data: &Path, out: &Path) -> bool {
             &g.0[g.1[q] as usize..g.1[q + 1] as usize]
         };
         let x = nib[p];
-        let rof = |a: u32| nfind(x, a);
-        let mut roots = 0u16;
-        for &w in ev.iter() {
-            roots |= 1 << rof((w & 15) as u32);
+        // root of each alias slot (identity when the person has no same-person links)
+        let mut rt = [0u8; 16];
+        for a in 0..16u32 {
+            rt[a as usize] = if x == 0 || a >= NALIAS as u32 { a as u8 } else { nfind(x, a) as u8 };
         }
-        let class_name = |r: u32, name: &mut Vec<u8>, tmp: &mut Vec<u8>| {
-            name.clear();
-            user_name(p as u32, r, ku, name);
+        let rof = |a: u32| rt[a as usize] as u32;
+        let mut amask = 0u16;
+        for &w in ev.iter() {
+            amask |= 1 << (w & 15);
+        }
+        let mut roots = 0u16;
+        let mut am = amask;
+        while am != 0 {
+            roots |= 1 << rof(am.trailing_zeros());
+            am &= am - 1;
+        }
+        // byte-wise smallest ID of the class, chosen by name_key, encoded once
+        let class_name = |r: u32, name: &mut Vec<u8>, _tmp: &mut Vec<u8>| {
+            let mut best = (name_key(scramble((p as u64) << 9 | r as u64, ku)), r);
             if x != 0 {
                 for a in 0..NALIAS as u32 {
-                    if a != r && nfind(x, a) == r {
-                        tmp.clear();
-                        user_name(p as u32, a, ku, tmp);
-                        if tmp < name {
-                            std::mem::swap(name, tmp);
+                    if a != r && rt[a as usize] as u32 == r {
+                        let k = name_key(scramble((p as u64) << 9 | a as u64, ku));
+                        if k < best.0 {
+                            best = (k, a);
                         }
                     }
                 }
             }
+            name.clear();
+            user_name(p as u32, best.1, ku, name);
         };
         let Bufs { name, tmp, evs, cks } = bf;
         if roots.count_ones() == 1 {
@@ -1398,6 +1427,25 @@ pub fn run(data: &Path, out: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn name_key_is_byte_order() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut ws: Vec<u64> = vec![0, 1, 9, 10, 35, 36, 37, 1295, 1296, 46655, 46656, MASK40, 36 * 36 * 36, 1, 360, 10];
+        for _ in 0..20000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ws.push(s & MASK40 >> (s % 40));
+        }
+        for i in 0..ws.len() {
+            for j in (i % 7..ws.len()).step_by(97) {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                enc_into(b'u', ws[i], &mut a);
+                enc_into(b'u', ws[j], &mut b);
+                assert_eq!(a.cmp(&b), name_key(ws[i]).cmp(&name_key(ws[j])), "{:?} {:?}", a, b);
+            }
+        }
+    }
     #[test]
     fn scramble_round_trips() {
         let mut s = 0x1234_5678_9abc_def1u64;
