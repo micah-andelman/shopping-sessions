@@ -1424,15 +1424,6 @@ pub fn run(data: &Path, out: &Path) -> bool {
     results.push(cxres);
     lap("complex identities");
 
-    let mut camp = vec![[0i64; 4]; ncamp * ndays];
-    for (_, c) in &results {
-        for (a, b) in camp.iter_mut().zip(c.iter()) {
-            for t in 0..4 {
-                a[t] += b[t];
-            }
-        }
-    }
-
     // ---------------- write Parquet (as fast::run)
     use super::pq::{self, Col, Kind};
     let ud_dir = out.join("user_daily");
@@ -1445,6 +1436,15 @@ pub fn run(data: &Path, out: &Path) -> bool {
         });
     };
     let write_camps = || {
+        // campaign totals merged here, beside the user_daily writes
+        let mut camp = vec![[0i64; 4]; ncamp * ndays];
+        for (_, c) in &results {
+            for (a, b) in camp.iter_mut().zip(c.iter()) {
+                for t in 0..4 {
+                    a[t] += b[t];
+                }
+            }
+        }
         let n = (0..ncamp * ndays).filter(|&i| camp[i][0] != 0 || camp[i][3] != 0).count();
         let mut c = [
             Col::new("campaign_id", Kind::Str, n),
