@@ -287,11 +287,43 @@ struct LinkTab {
     mask: usize,
     slots: Vec<[u64; 2]>,
     n: usize,
+    /// Bit filter over ids whose person is a DIFFERENT id (no false negatives). Ids that are their
+    /// own person (unlinked, or the smallest id of their group: most rows) skip the big table.
+    nf: Vec<u64>,
+    fmask: usize,
 }
 impl LinkTab {
     fn new(n: usize) -> Self {
         let cap = (n * 2).max(16).next_power_of_two();
-        LinkTab { mask: cap - 1, slots: vec![[0u64; 2]; cap], n: 0 }
+        LinkTab { mask: cap - 1, slots: vec![[0u64; 2]; cap], n: 0, nf: Vec::new(), fmask: 0 }
+    }
+    #[inline]
+    fn fbit(k: u64) -> usize {
+        mix(k ^ 0x6a09_e667_f3bc_c909) as usize
+    }
+    /// Build the non-root filter (~16 bits per non-root id). SS_NOFILTER=1 disables it.
+    fn build_filter(&mut self) {
+        if std::env::var("SS_NOFILTER").is_ok() {
+            return;
+        }
+        let cnt = self.slots.iter().filter(|s| s[0] != 0 && s[0] != s[1]).count();
+        let bits = (cnt * 16).max(1 << 12).next_power_of_two();
+        self.fmask = bits - 1;
+        self.nf = vec![0u64; bits / 64];
+        for s in &self.slots {
+            if s[0] != 0 && s[0] != s[1] {
+                let b = Self::fbit(s[0]) & self.fmask;
+                self.nf[b >> 6] |= 1u64 << (b & 63);
+            }
+        }
+    }
+    #[inline]
+    fn maybe_linked(&self, k: u64) -> bool {
+        if self.nf.is_empty() {
+            return true;
+        }
+        let b = Self::fbit(k) & self.fmask;
+        self.nf[b >> 6] & (1u64 << (b & 63)) != 0
     }
     #[inline]
     fn home(&self, k: u64) -> usize {
@@ -335,13 +367,16 @@ impl LinkTab {
     /// Resolve keys in place, prefetching DIST lookups ahead.
     fn resolve_all(&self, ks: &mut [u64]) {
         const DIST: usize = 16;
-        for i in 0..ks.len().min(DIST) {
-            self.prefetch(ks[i]);
+        // only ids the filter flags can map to another id; the rest are their own person
+        let todo: Vec<u32> = (0..ks.len() as u32).filter(|&i| self.maybe_linked(ks[i as usize])).collect();
+        for &i in todo.iter().take(DIST) {
+            self.prefetch(ks[i as usize]);
         }
-        for i in 0..ks.len() {
-            if i + DIST < ks.len() {
-                self.prefetch(ks[i + DIST]);
+        for j in 0..todo.len() {
+            if j + DIST < todo.len() {
+                self.prefetch(ks[todo[j + DIST] as usize]);
             }
+            let i = todo[j] as usize;
             ks[i] = self.get(ks[i]);
         }
     }
@@ -352,7 +387,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
-            eprintln!("{:>8.3}s  {}", t0.elapsed().as_secs_f64(), what)
+            // cumulative process user/sys CPU seconds and minor faults at each lap
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            eprintln!("{:>8.3}s  {}  [usr {:.3} sys {:.3} minflt {}]", t0.elapsed().as_secs_f64(), what, tv(ru.ru_utime), tv(ru.ru_stime), ru.ru_minflt)
         }
     };
     // SS_TIMELINE=1 (diagnostic): every 5 ms print how many threads were busy, from getrusage CPU time.
@@ -871,6 +910,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let r = find(&mut parent, i);
             table.insert(lids[i as usize], lids[r as usize]);
         }
+        table.build_filter();
         if verbose { eprintln!("  link {} {:.3}s", "table", t0.elapsed().as_secs_f64()); }
         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
         Some((table, fb))
