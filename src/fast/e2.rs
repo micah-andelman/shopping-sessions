@@ -595,6 +595,56 @@ impl Uf {
     }
 }
 
+/// argv and envp (with SS_E2=0 first) for re-executing this binary, built before any work so
+/// the fault handler does not allocate. Pointers to leaked, NUL-terminated arrays.
+static RX_ARGV: AtomicUsize = AtomicUsize::new(0);
+static RX_ENVP: AtomicUsize = AtomicUsize::new(0);
+static RX_EXE: AtomicUsize = AtomicUsize::new(0);
+fn prep_reexec() {
+    use std::os::unix::ffi::OsStrExt;
+    let cs = |b: &[u8]| -> *const libc::c_char { std::ffi::CString::new(b.to_vec()).map(|c| c.into_raw() as *const libc::c_char).unwrap_or(std::ptr::null()) };
+    let mut argv: Vec<*const libc::c_char> = std::env::args_os().map(|a| cs(a.as_bytes())).filter(|p| !p.is_null()).collect();
+    argv.push(std::ptr::null());
+    let mut envp: Vec<*const libc::c_char> = vec![cs(b"SS_E2=0")];
+    for (k, v) in std::env::vars_os() {
+        if k.as_bytes() == b"SS_E2" {
+            continue;
+        }
+        let mut e = k.as_bytes().to_vec();
+        e.push(b'=');
+        e.extend_from_slice(v.as_bytes());
+        let p = cs(&e);
+        if !p.is_null() {
+            envp.push(p);
+        }
+    }
+    envp.push(std::ptr::null());
+    RX_ARGV.store(Box::leak(argv.into_boxed_slice()).as_ptr() as usize, Relaxed);
+    RX_ENVP.store(Box::leak(envp.into_boxed_slice()).as_ptr() as usize, Relaxed);
+    RX_EXE.store(cs(b"/proc/self/exe") as usize, Relaxed);
+}
+/// Re-execute with engine 2 off, unless output writing has started (then return). Async-signal
+/// safe: only atomics and execve.
+fn reexec_fallback() {
+    if WRITING.load(std::sync::atomic::Ordering::SeqCst) || RX_EXE.load(Relaxed) == 0 {
+        return;
+    }
+    unsafe {
+        libc::execve(
+            RX_EXE.load(Relaxed) as *const libc::c_char,
+            RX_ARGV.load(Relaxed) as *const *const libc::c_char,
+            RX_ENVP.load(Relaxed) as *const *const libc::c_char,
+        )
+    };
+}
+extern "C" fn on_fault(sig: libc::c_int) {
+    reexec_fallback();
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
 /// Set when engine 2 starts writing output (see the panic hook in `run`).
 static WRITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -604,25 +654,21 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // engine 2 off (SS_E2=0), so unexpected data costs time, never a crash. Once writing has
     // started the panic stays a panic (partial output must not be mixed with a second run's).
     if std::env::var("SS_E2NOREEXEC").is_err() {
+        prep_reexec();
         std::panic::set_hook(Box::new(|info| {
             eprintln!("engine2 panic: {}", info);
-            if WRITING.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            use std::os::unix::ffi::OsStrExt;
-            let args: Vec<std::ffi::CString> = std::env::args_os()
-                .filter_map(|a| std::ffi::CString::new(a.as_bytes().to_vec()).ok())
-                .collect();
-            let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
-            argv.push(std::ptr::null());
-            std::env::set_var("SS_E2", "0");
-            let exe = std::ffi::CString::new("/proc/self/exe").unwrap();
-            unsafe { libc::execv(exe.as_ptr(), argv.as_ptr()) };
-            // exec failed: fall through to the default abort
+            reexec_fallback();
         }));
+        // A fault (SIGSEGV/SIGBUS from an over-read, SIGILL, SIGFPE) is handled the same way.
+        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+            unsafe { libc::signal(sig, on_fault as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+        }
     }
     if std::env::var("SS_E2PANICTEST").is_ok() {
         panic!("SS_E2PANICTEST");
+    }
+    if std::env::var("SS_E2SEGVTEST").is_ok() {
+        unsafe { libc::raise(libc::SIGSEGV) };
     }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
