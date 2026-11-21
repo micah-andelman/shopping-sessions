@@ -1,0 +1,48 @@
+diff --git a/src/fast.rs b/src/fast.rs
+index 07d8477..115f306 100644
+--- a/src/fast.rs
++++ b/src/fast.rs
+@@ -1873,6 +1873,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
+     }
+     struct Acc {
+         camp: Vec<[i64; 4]>,
++        // assists counted day-major in u32 (one ~8 KB row per day stays in L1) and folded into
++        // camp[..][3] once per worker; the [i64; 4] array is ~1 MB and missed on every assist.
++        assist: Vec<u32>,
+         cnt: Vec<u32>,
+         active: Vec<u32>,
+         catsum: Vec<i64>,
+@@ -1959,10 +1962,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
+             slot[0] += 1;
+             slot[1] += purch as i64;
+             slot[2] += rev;
+-            let (cnt, active, camp) = (&acc.cnt, &mut acc.active, &mut acc.camp);
++            let (cnt, active) = (&acc.cnt, &mut acc.active);
+             active.retain(|&c| cnt[c as usize] > 0);
++            let arow = &mut acc.assist[di * ncamp..(di + 1) * ncamp];
+             for &c in active.iter() {
+-                camp[c as usize * ndays + di][3] += 1;
++                arow[c as usize] += 1;
+             }
+             let r = row.as_mut().unwrap();
+             r.sessions += 1;
+@@ -1992,6 +1996,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
+             let mut rows = UserOut::new(&fbm, &cats, est_rows);
+             let mut acc = Acc {
+                 camp: vec![[0i64; 4]; ncamp * ndays],
++                assist: vec![0u32; ncamp * ndays],
+                 cnt: vec![0u32; ncamp],
+                 active: Vec::new(),
+                 catsum: vec![0i64; ncats],
+@@ -2094,6 +2099,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
+                     i = j;
+                 }
+             }
++            for d in 0..ndays {
++                for c in 0..ncamp {
++                    acc.camp[c * ndays + d][3] += acc.assist[d * ncamp + c] as i64;
++                }
++            }
+             (rows, acc.camp)
+         })
+         .collect();
