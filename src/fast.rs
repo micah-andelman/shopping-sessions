@@ -370,7 +370,8 @@ impl LinkTab {
     fn fbit(k: u64) -> usize {
         mix(k ^ 0x6a09_e667_f3bc_c909) as usize
     }
-    /// Build the non-root filter (~16 bits per non-root id). SS_NOFILTER=1 disables it.
+    /// Build the non-root filter (~16 bits per non-root id) by scanning the table (test reference).
+    #[cfg(test)]
     fn build_filter(&mut self) {
         if std::env::var("SS_NOFILTER").is_ok() {
             return;
@@ -384,6 +385,19 @@ impl LinkTab {
                 let b = Self::fbit(s[0]) & self.fmask;
                 self.nf[b >> 6] |= 1u64 << (b & 63);
             }
+        }
+    }
+    /// Same filter as `build_filter`, from the list of non-root ids (`cnt` of them).
+    fn build_filter_from(&mut self, cnt: usize, nonroot: impl Iterator<Item = u64>) {
+        if std::env::var("SS_NOFILTER").is_ok() {
+            return;
+        }
+        let bits = (cnt * 16).max(1 << 12).next_power_of_two();
+        self.fmask = bits - 1;
+        self.nf = vec![0u64; bits / 64];
+        for k in nonroot {
+            let b = Self::fbit(k) & self.fmask;
+            self.nf[b >> 6] |= 1u64 << (b & 63);
         }
     }
     #[inline]
@@ -409,6 +423,26 @@ impl LinkTab {
         }
         self.slots[i] = [k, v];
         self.n += 1;
+    }
+    /// Build step: dense number of id `k` (its slot value), numbering new ids in order of first
+    /// appearance and recording them in `ids`.
+    #[inline]
+    fn intern(&mut self, k: u64, ids: &mut Vec<u64>) -> u32 {
+        let mut i = self.home(k);
+        loop {
+            let s = self.slots[i];
+            if s[0] == k {
+                return s[1] as u32;
+            }
+            if s[0] == 0 {
+                let id = ids.len() as u32;
+                self.slots[i] = [k, id as u64];
+                self.n += 1;
+                ids.push(k);
+                return id;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     /// Person key of an id key (itself when unlinked).
     #[inline]
@@ -449,6 +483,62 @@ impl LinkTab {
             ks[i] = self.get(ks[i]);
         }
     }
+}
+
+/// Link table from the parsed id pairs: id key -> key of the byte-wise smallest id of its
+/// connected component. One open-addressing table does both jobs: while the pairs are read it
+/// maps an id to a dense number (for the union-find), then every slot value is replaced by the
+/// component's root key. Roots are chosen by id order during the union, so no sort is needed.
+fn build_link_table(parts: &[(Vec<(u64, u64)>, Fb)], fbm: &HashMap<u64, &'static [u8]>) -> LinkTab {
+    let npairs: usize = parts.iter().map(|p| p.0.len()).sum();
+    let mut table = LinkTab::new(npairs * 2);
+    let mut ids: Vec<u64> = Vec::with_capacity(npairs * 2);
+    let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            let g = p[p[x as usize] as usize];
+            p[x as usize] = g;
+            x = g;
+        }
+        x
+    }
+    const DIST: usize = 8;
+    for (v, _) in parts {
+        for (j, &(a, b)) in v.iter().enumerate() {
+            if let Some(&(pa, pb)) = v.get(j + DIST) {
+                table.prefetch(pa);
+                table.prefetch(pb);
+            }
+            let ia = table.intern(a, &mut ids);
+            let ib = table.intern(b, &mut ids);
+            while parent.len() < ids.len() {
+                parent.push(parent.len() as u32);
+            }
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                // the root of a merged component is the smaller id, so every root is its
+                // component's smallest id
+                let (ka, kb) = (ids[ra as usize], ids[rb as usize]);
+                if cmp_id(ka, kb, fbm) == std::cmp::Ordering::Less {
+                    parent[rb as usize] = ra
+                } else {
+                    parent[ra as usize] = rb
+                }
+            }
+        }
+    }
+    // root key per dense id (sequential over the ids), then one sequential pass over the slots
+    let roots: Vec<u64> = (0..ids.len() as u32).map(|i| ids[find(&mut parent, i) as usize]).collect();
+    for s in table.slots.iter_mut() {
+        if s[0] != 0 {
+            s[1] = roots[s[1] as usize];
+        }
+    }
+    // the non-root filter from the id list instead of two more scans of the whole table
+    let nonroot = ids.iter().zip(roots.iter()).filter(|(a, b)| a != b).map(|(a, _)| *a);
+    table.build_filter_from(nonroot.clone().count(), nonroot);
+    table
 }
 
 pub fn run(data: &Path, out: &Path) -> bool {
@@ -972,50 +1062,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     if verbose { eprintln!("  link {} {:.3}s", "parsed", t0.elapsed().as_secs_f64()); }
     let link_job = move || -> Option<(LinkTab, Fb)> {
         let fbm = merge_fb(parts.iter().map(|p| &p.1))?;
-        let mut lids: Vec<u64> = Vec::with_capacity(parts.iter().map(|p| p.0.len() * 2).sum());
-        for (v, _) in &parts {
-            for &(a, b) in v {
-                lids.push(a);
-                lids.push(b);
-            }
-        }
-        lids.par_sort_unstable();
-        lids.dedup();
-        if !fbm.is_empty() {
-            lids.sort_by(|&a, &b| cmp_id(a, b, &fbm));
-        }
-        if verbose { eprintln!("  link {} {:.3}s", "sorted", t0.elapsed().as_secs_f64()); }
-        let mut idx: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::with_capacity(lids.len());
-        for (i, &k) in lids.iter().enumerate() {
-            idx.insert_unique(th(k), (k, i as u32), |e| th(e.0));
-        }
-        if verbose { eprintln!("  link {} {:.3}s", "idx", t0.elapsed().as_secs_f64()); }
-        let get = |k: u64| idx.find(th(k), |e| e.0 == k).unwrap().1;
-        let mut parent: Vec<u32> = (0..lids.len() as u32).collect();
-        fn find(p: &mut [u32], mut x: u32) -> u32 {
-            while p[x as usize] != x {
-                let g = p[p[x as usize] as usize];
-                p[x as usize] = g;
-                x = g;
-            }
-            x
-        }
-        for (v, _) in &parts {
-            for &(a, b) in v {
-                let ra = find(&mut parent, get(a));
-                let rb = find(&mut parent, get(b));
-                if ra != rb {
-                    if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
-                }
-            }
-        }
-        if verbose { eprintln!("  link {} {:.3}s", "uf", t0.elapsed().as_secs_f64()); }
-        let mut table = LinkTab::new(lids.len());
-        for i in 0..lids.len() as u32 {
-            let r = find(&mut parent, i);
-            table.insert(lids[i as usize], lids[r as usize]);
-        }
-        table.build_filter();
+        let table = build_link_table(&parts, &fbm);
         if verbose { eprintln!("  link {} {:.3}s", "table", t0.elapsed().as_secs_f64()); }
         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
         Some((table, fb))
@@ -1759,6 +1806,131 @@ mod pack_tests {
                 assert_eq!(pack(f), pack_ref(f));
             }
             libc::munmap(m, 3 * pg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// The previous construction (sort ids, index table, union-find by index, second table).
+    fn build_link_table_ref(parts: &[(Vec<(u64, u64)>, Fb)], fbm: &HashMap<u64, &'static [u8]>) -> LinkTab {
+        let mut lids: Vec<u64> = Vec::with_capacity(parts.iter().map(|p| p.0.len() * 2).sum());
+        for (v, _) in parts.iter() {
+            for &(a, b) in v {
+                lids.push(a);
+                lids.push(b);
+            }
+        }
+        lids.sort_unstable();
+        lids.dedup();
+        if !fbm.is_empty() {
+            lids.sort_by(|&a, &b| cmp_id(a, b, fbm));
+        }
+        let mut idx: hashbrown::HashTable<(u64, u32)> = hashbrown::HashTable::with_capacity(lids.len());
+        for (i, &k) in lids.iter().enumerate() {
+            idx.insert_unique(th(k), (k, i as u32), |e| th(e.0));
+        }
+        let get = |k: u64| idx.find(th(k), |e| e.0 == k).unwrap().1;
+        let mut parent: Vec<u32> = (0..lids.len() as u32).collect();
+        fn find(p: &mut [u32], mut x: u32) -> u32 {
+            while p[x as usize] != x {
+                let g = p[p[x as usize] as usize];
+                p[x as usize] = g;
+                x = g;
+            }
+            x
+        }
+        for (v, _) in parts.iter() {
+            for &(a, b) in v {
+                let ra = find(&mut parent, get(a));
+                let rb = find(&mut parent, get(b));
+                if ra != rb {
+                    if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
+                }
+            }
+        }
+        let mut table = LinkTab::new(lids.len());
+        for i in 0..lids.len() as u32 {
+            let r = find(&mut parent, i);
+            table.insert(lids[i as usize], lids[r as usize]);
+        }
+        table.build_filter();
+        table
+    }
+
+    fn contents(t: &LinkTab) -> Vec<[u64; 2]> {
+        let mut v: Vec<[u64; 2]> = t.slots.iter().filter(|s| s[0] != 0).cloned().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn one_table_build_matches_two_table_build() {
+        let mut s = 0x0123_4567_89AB_CDEFu64;
+        // id pool: short packed ids plus ids that need the hashed fallback (non-alphabet bytes,
+        // longer than 10), so both key kinds and their byte-wise ordering are covered
+        let mut pool: Vec<&'static [u8]> = Vec::new();
+        for i in 0..3000u32 {
+            let txt = match i % 7 {
+                0 => format!("u{}", i),
+                1 => format!("U{:05}", i),
+                2 => format!("user_{}", i % 500),
+                3 => format!("u-{}", i),
+                4 => format!("averyveryverylongid{}", i),
+                5 => format!("u{}\r", i),
+                _ => format!("{}", i),
+            };
+            pool.push(Box::leak(txt.into_bytes().into_boxed_slice()));
+        }
+        for round in 0..300 {
+            let nparts = 1 + (rng(&mut s) % 4) as usize;
+            let universe = match round % 4 {
+                0 => 8,
+                1 => 60,
+                2 => 600,
+                _ => pool.len(),
+            };
+            let mut parts: Vec<(Vec<(u64, u64)>, Fb)> = Vec::new();
+            for _ in 0..nparts {
+                let mut fb = Fb::new();
+                let n = (rng(&mut s) % if round % 5 == 0 { 3 } else { 900 }) as usize;
+                let mut v = Vec::new();
+                for _ in 0..n {
+                    let a = pool[(rng(&mut s) as usize) % universe];
+                    // chains, self links and repeated pairs
+                    let b = match rng(&mut s) % 10 {
+                        0 => a,
+                        1..=3 => pool[((rng(&mut s) as usize) % universe + 1) % universe],
+                        _ => pool[(rng(&mut s) as usize) % universe],
+                    };
+                    v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
+                }
+                parts.push((v, fb));
+            }
+            let fbm = merge_fb(parts.iter().map(|p| &p.1)).unwrap();
+            let new = build_link_table(&parts, &fbm);
+            let old = build_link_table_ref(&parts, &fbm);
+            assert_eq!(new.n, old.n);
+            assert_eq!(contents(&new), contents(&old), "round {}", round);
+            assert!(new.nf == old.nf && new.fmask == old.fmask && !new.nf.is_empty());
+            // lookups agree for members and for ids that are not in any link
+            for id in pool.iter().take(universe.min(700)) {
+                let mut fb = Fb::new();
+                let k = key_of(id, &mut fb);
+                assert_eq!(new.get(k), old.get(k));
+                if new.get(k) != k {
+                    assert!(new.maybe_linked(k));
+                }
+            }
         }
     }
 }
