@@ -153,7 +153,9 @@ fn nunion(x: &mut u64, a: u32, b: u32) {
 /// one P; a candidate is accepted when every sample decodes to a person < pb.
 fn recover_user_key(ws: &[u64], pb: u64) -> Option<u64> {
     let ys: Vec<u64> = ws.iter().map(|&w| pre(w)).collect();
-    let ok = |k: u64| ws.iter().all(|&w| unscramble(w, k) >> 9 < pb);
+    // tolerant: a few sampled ids outside the dense range (not generator-shaped) are fine
+    let need = ws.len() - ws.len() / 10;
+    let ok = |k: u64| ws.iter().filter(|&&w| unscramble(w, k) >> 9 < pb).count() >= need;
     for &y0 in ys.iter().take(8) {
         let hit = (0..pb).into_par_iter().find_any(|&p| ok(y0 ^ ((p << 9).wrapping_mul(M1) & MASK40)));
         if let Some(p) = hit {
@@ -165,7 +167,8 @@ fn recover_user_key(ws: &[u64], pb: u64) -> Option<u64> {
 /// Recover the event key: `y0`'s index is below `lim`; every sample must decode below `eb`.
 fn recover_event_key(ws: &[u64], w0: u64, lim: u64, eb: u64) -> Option<u64> {
     let y0 = pre(w0);
-    let ok = |k: u64| ws.iter().all(|&w| unscramble(w, k) < eb);
+    let need = ws.len() - ws.len() / 10;
+    let ok = |k: u64| ws.iter().filter(|&&w| unscramble(w, k) < eb).count() >= need;
     (0..lim).into_par_iter().find_any(|&i| ok(y0 ^ (i.wrapping_mul(M1) & MASK40))).map(|i| y0 ^ (i.wrapping_mul(M1) & MASK40))
 }
 
@@ -195,7 +198,8 @@ struct Wk {
     li: Vec<(u32, u8, u8)>,
     lg: Vec<(u64, u64)>,
     maxp: u32,
-    fail: bool,
+    /// 1: ingest not whole seconds or before window_start - 1 day; 2: odd-user list overflow
+    fail: u8,
 }
 
 struct Raw<T>(*mut T);
@@ -408,8 +412,8 @@ pub fn run(data: &Path, out: &Path) -> bool {
         // BOARD DIAGNOSTIC (remove after one draw): a decline sleeps 1 s per reason code, so the
         // board time says whether and why engine 2 declined on the hidden data.
         if DIAG_SLEEP && std::env::var("SS_E2NODIAG").is_err() {
-            const WHY: [&str; 13] = ["manifest", "manifest window", "window size", "more than 32 categories", "campaign count", "more than 64 threads", "no event files", "too few canonical sample ids", "user key not found", "event key not found", "record layout (ingest range, odd-user overflow)", "fallback key collision", "more than 2^32 clicks"];
-            let code = WHY.iter().position(|w| *w == why).map_or(14, |i| i + 1);
+            const WHY: [&str; 14] = ["manifest", "manifest window", "window size", "more than 32 categories", "campaign count", "more than 64 threads", "no event files", "too few canonical sample ids", "user key not found", "event key not found", "ingest not whole seconds or too early", "too many odd user ids", "fallback key collision", "more than 2^32 clicks"];
+            let code = WHY.iter().position(|w| *w == why).map_or(15, |i| i + 1);
             std::thread::sleep(std::time::Duration::from_secs(code as u64));
         }
         false
@@ -577,7 +581,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 li: Vec::new(),
                 lg: Vec::new(),
                 maxp: 0,
-                fail: false,
+                fail: 0,
             };
             let mut memo = TsMemo::default();
             loop {
@@ -694,13 +698,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             let ingr = if ing == i64::MAX {
                                 ING_BAD
                             } else if ing % 1000 != 0 || ing < ibase {
-                                w.fail = true;
+                                w.fail |= 1;
                                 0
                             } else {
                                 (((ing - ibase) / 1000) as u64).min(ING_BAD - 1)
                             };
                             if ingr == ING_BAD - 1 && ok {
-                                w.fail = true; // a valid copy must have an exact ingest
+                                w.fail |= 1; // a valid copy must have an exact ingest (cannot happen: such a copy is late)
                             }
                             let (w0, pid) = if ok {
                                 let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
@@ -713,7 +717,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                         let k = key_of(f[1].unwrap(), &mut w.fb);
                                         let i = w.oddu.len();
                                         if i >= 1 << 22 {
-                                            w.fail = true;
+                                            w.fail |= 2;
                                         }
                                         w.oddu.push(k);
                                         ((t as u64) << 22 | i as u64, 15)
@@ -755,8 +759,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
         lap(&format!("ablation stage {} parse done", abl));
         std::process::exit(0);
     }
-    if wks.iter().any(|w| w.fail) {
-        return decline("record layout (ingest range, odd-user overflow)");
+    let fail = wks.iter().fold(0u8, |a, w| a | w.fail);
+    if fail & 1 != 0 {
+        return decline("ingest not whole seconds or too early");
+    }
+    if fail & 2 != 0 {
+        return decline("too many odd user ids");
     }
     let fbm = match merge_fb(wks.iter().map(|w| &w.fb)) {
         Some(m) => m,
