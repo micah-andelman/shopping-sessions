@@ -13,7 +13,8 @@ Board scores vary about 20% across scoring machines, so one board number cannot 
 | v5.5 | 44f244e | 0.66 s | - | 1.62 s | prefetched link table, dedup prepass, purchases-only product lookup |
 | v5.7 | 26b0e6b | 0.60 s | 1.63 s | 1.39 s | Parquet writer, SWAR timestamps, links-first scheduling |
 | v5.8 | 848af15 | 0.52 s | - | 1.37 s | radix person stage, largest-first person scheduling |
-| main | 3860b34 | - | - | - | + per-worker date memo (row body -5% in microbench) |
+| v5.8 (re-timed) | 848af15 | 0.525 s | 1.793 s | 1.37 s | same binary, bundle window 23:35 |
+| v5.9 | HEAD | 0.495 s | 1.700 s | - | + date memo (c45), PEXT pack (agent B), two-stage scanner scan2 (agent A); 60M = golden |
 
 Rejected experiments (patches in `experiments/`): 16-byte dedup records, parallel binary-search link build,
 parallel small-table load with small link chunks.
