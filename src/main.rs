@@ -296,6 +296,7 @@ impl<'a> Dict<'a> {
 /// One parsed event line (any copy). `ok` = this copy passes every validity and lateness rule.
 struct RawEv<'a> {
     eid: &'a [u8],
+    eh: u64,
     uid: &'a [u8],
     ing: i64,
     ts: i64,
@@ -388,6 +389,7 @@ fn main() {
     lap("opened");
 
     // ---------------- links (small): distinct IDs sorted byte-wise, so index order = byte order
+    let link_job = || {
     let lk_chunks = chunks(lk_maps);
     let links: Vec<(&[u8], &[u8])> = lk_chunks
         .par_iter()
@@ -402,14 +404,15 @@ fn main() {
             v.into_iter()
         })
         .collect();
-    let mut lids: Vec<&[u8]> = Vec::with_capacity(links.len() * 2);
+    let mut lids: Vec<&'static [u8]> = Vec::with_capacity(links.len() * 2);
     for &(a, b) in &links {
         lids.push(a);
         lids.push(b);
     }
     lids.par_sort_unstable();
     lids.dedup();
-    let mut ldict = Dict::new(lids.len() * 2);
+    let lids: &'static [&'static [u8]] = Vec::leak(lids);
+    let mut ldict: Dict<'static> = Dict::new(lids.len() * 2);
     for (i, k) in lids.iter().enumerate() {
         ldict.insert(k, i as u32);
     }
@@ -435,20 +438,9 @@ fn main() {
         parent[i as usize] = r;
     }
     let root_hash: Vec<u64> = (0..lids.len()).into_par_iter().map(|i| if parent[i] as usize == i { h64(lids[i]) } else { 0 }).collect();
-    // person (key, name) of a user id
-    let person = |uid: &'_ [u8]| -> (u64, usize) {
-        let h = h64(uid);
-        match ldict.get_h(h, uid) {
-            Some(i) => {
-                let r = parent[i as usize] as usize;
-                (root_hash[r], r)
-            }
-            None => (h, usize::MAX),
-        }
+    (lids, ldict, parent, root_hash)
     };
-    lap(&format!("links: {} lines, {} ids", links.len(), lids.len()));
-
-    // ---------------- parse events straight to compact records
+    let ev_job = || {
     let ev_chunks = chunks(ev_maps);
     let evs: Vec<Vec<RawEv>> = ev_chunks
         .par_iter()
@@ -480,11 +472,26 @@ fn main() {
                     if p < 0 { ok = false } else { price = p as u32 }
                 }
                 let cat = if ok { prod.get(f[5].unwrap()).map(|c| c as u16).unwrap_or(unknown) } else { 0 };
-                v.push(RawEv { eid, uid: f[1].unwrap_or(b""), ing, ts, price, cat, ok });
+                v.push(RawEv { eid, eh: h64(eid), uid: f[1].unwrap_or(b""), ing, ts, price, cat, ok });
             });
             v
         })
         .collect();
+    evs
+    };
+    let ((lids, ldict, parent, root_hash), evs) = rayon::join(link_job, ev_job);
+    lap(&format!("links ({} ids) and events parsed", lids.len()));
+    // person (key, name) of a user id
+    let person = |uid: &'_ [u8]| -> (u64, usize) {
+        let h = h64(uid);
+        match ldict.get_h(h, uid) {
+            Some(i) => {
+                let r = parent[i as usize] as usize;
+                (root_hash[r], r)
+            }
+            None => (h, usize::MAX),
+        }
+    };
     let mut offs = Vec::with_capacity(evs.len() + 1);
     let mut n_ev = 0usize;
     for v in &evs {
@@ -493,54 +500,123 @@ fn main() {
     }
     lap(&format!("parsed {} event lines", n_ev));
 
+    let ck_job = || {
+    // ---------------- clicks (no dedup needed: copies are identical, so they cannot change credit or assists)
+    let ck_chunks = chunks(ck_maps);
+    let cparts: Vec<(Vec<Rec>, Vec<CPay>)> = ck_chunks
+        .par_iter()
+        .map(|&(mi, s, e)| {
+            let d: &[u8] = &ck_maps[mi][s..e];
+            let mut k = Vec::with_capacity(d.len() / 45 + 16);
+            let mut p = Vec::with_capacity(d.len() / 45 + 16);
+            for_lines(d, |l| {
+                let f = match fields::<4>(l) {
+                    Some(f) => f,
+                    None => return,
+                };
+                let (cid, uid) = match (f[0], f[1]) {
+                    (Some(c), Some(u)) => (c, u),
+                    _ => return,
+                };
+                let ts = parse_ts(f[3]);
+                if ts == BAD || ts < cws || ts >= we {
+                    return;
+                }
+                let camp = match f[2].and_then(|c| camp_map.get(c)) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let (key, r) = person(uid);
+                let name = if r == usize::MAX { uid } else { lids[r] };
+                k.push((key, ((ts - cws) as u64) << 32));
+                p.push(CPay { name, cid, camp });
+            });
+            (k, p)
+        })
+        .collect();
+    let n_ck: usize = cparts.iter().map(|p| p.0.len()).sum();
+    let mut ck: Vec<Rec> = Vec::with_capacity(n_ck);
+    let mut cpay: Vec<CPay> = Vec::with_capacity(n_ck);
+    for (k, p) in cparts {
+        let base = ck.len() as u64;
+        ck.extend(k.into_iter().enumerate().map(|(i, (a, b))| (a, b | (base + i as u64))));
+        cpay.extend(p);
+    }
+    (ck, cpay, n_ck)
+    };
+    let ev_job2 = || {
     // ---------------- dedup on event_id: smallest ingest_ts wins. kept[g] = 1 for the surviving copy.
+    const B: usize = 1024;
+    let cnts: Vec<Vec<u32>> = evs
+        .par_iter()
+        .map(|v| {
+            let mut c = vec![0u32; B];
+            for e in v {
+                c[(e.eh >> 54) as usize] += 1;
+            }
+            c
+        })
+        .collect();
+    let mut bstart = vec![0usize; B + 1];
+    for c in &cnts {
+        for b in 0..B {
+            bstart[b + 1] += c[b] as usize;
+        }
+    }
+    for b in 0..B {
+        bstart[b + 1] += bstart[b];
+    }
+    let mut run = bstart[..B].to_vec();
+    let coffs: Vec<Vec<usize>> = cnts
+        .iter()
+        .map(|c| {
+            let o = run.clone();
+            for b in 0..B {
+                run[b] += c[b] as usize;
+            }
+            o
+        })
+        .collect();
     let mut keys: Vec<(u64, i64, u32)> = Vec::with_capacity(n_ev);
     unsafe { keys.set_len(n_ev) };
     {
         let kp = Raw(keys.as_mut_ptr());
-        evs.par_iter().zip(offs.par_iter()).for_each(|(v, &o)| {
+        evs.par_iter().zip(offs.par_iter()).zip(coffs.into_par_iter()).for_each(|((v, &o), mut co)| {
             let kp = &kp;
             for (j, e) in v.iter().enumerate() {
-                unsafe { *kp.0.add(o + j) = (h64(e.eid), e.ing, (o + j) as u32) };
+                let b = (e.eh >> 54) as usize;
+                unsafe { *kp.0.add(co[b]) = (e.eh, e.ing, (o + j) as u32) };
+                co[b] += 1;
             }
         });
     }
-    keys.par_sort_unstable();
     let mut kept = vec![0u8; n_ev];
     {
-        let nth = rayon::current_num_threads() * 8;
-        let mut bounds = vec![0usize];
-        for k in 1..nth {
-            let mut p = n_ev * k / nth;
-            while p > 0 && p < n_ev && keys[p].0 == keys[p - 1].0 {
-                p += 1;
-            }
-            if p > *bounds.last().unwrap() && p < n_ev {
-                bounds.push(p);
-            }
-        }
-        bounds.push(n_ev);
         let locate = |g: u32| -> &RawEv {
             let g = g as usize;
             let ci = offs.partition_point(|&o| o <= g) - 1;
             &evs[ci][g - offs[ci]]
         };
         let kp = Raw(kept.as_mut_ptr());
-        bounds.par_windows(2).for_each(|w| {
-            let kp = &kp;
-            let mut i = w[0];
-            while i < w[1] {
+        let keyp = Raw(keys.as_mut_ptr());
+        (0..B).into_par_iter().for_each(|b| {
+            let (kp, keyp) = (&kp, &keyp);
+            let sl = unsafe { std::slice::from_raw_parts_mut(keyp.0.add(bstart[b]), bstart[b + 1] - bstart[b]) };
+            sl.sort_unstable();
+            let n = sl.len();
+            let mut i = 0;
+            while i < n {
                 let mut j = i + 1;
-                while j < w[1] && keys[j].0 == keys[i].0 {
+                while j < n && sl[j].0 == sl[i].0 {
                     j += 1;
                 }
                 if j == i + 1 {
-                    unsafe { *kp.0.add(keys[i].2 as usize) = 1 };
+                    unsafe { *kp.0.add(sl[i].2 as usize) = 1 };
                 } else {
                     for a in i..j {
-                        let ea = locate(keys[a].2).eid;
-                        if !(i..a).any(|b| locate(keys[b].2).eid == ea) {
-                            unsafe { *kp.0.add(keys[a].2 as usize) = 1 };
+                        let ea = locate(sl[a].2).eid;
+                        if !(i..a).any(|c| locate(sl[c].2).eid == ea) {
+                            unsafe { *kp.0.add(sl[a].2 as usize) = 1 };
                         }
                     }
                 }
@@ -585,49 +661,11 @@ fn main() {
             }
         });
     }
+    (ek, epay, n_good)
+    };
+    let ((mut ek, epay, n_good), (mut ck, cpay, n_ck)) = rayon::join(ev_job2, ck_job);
     lap(&format!("{} valid events", n_good));
 
-    // ---------------- clicks (no dedup needed: copies are identical, so they cannot change credit or assists)
-    let ck_chunks = chunks(ck_maps);
-    let cparts: Vec<(Vec<Rec>, Vec<CPay>)> = ck_chunks
-        .par_iter()
-        .map(|&(mi, s, e)| {
-            let d: &[u8] = &ck_maps[mi][s..e];
-            let mut k = Vec::with_capacity(d.len() / 45 + 16);
-            let mut p = Vec::with_capacity(d.len() / 45 + 16);
-            for_lines(d, |l| {
-                let f = match fields::<4>(l) {
-                    Some(f) => f,
-                    None => return,
-                };
-                let (cid, uid) = match (f[0], f[1]) {
-                    (Some(c), Some(u)) => (c, u),
-                    _ => return,
-                };
-                let ts = parse_ts(f[3]);
-                if ts == BAD || ts < cws || ts >= we {
-                    return;
-                }
-                let camp = match f[2].and_then(|c| camp_map.get(c)) {
-                    Some(c) => c,
-                    None => return,
-                };
-                let (key, r) = person(uid);
-                let name = if r == usize::MAX { uid } else { lids[r] };
-                k.push((key, ((ts - cws) as u64) << 32));
-                p.push(CPay { name, cid, camp });
-            });
-            (k, p)
-        })
-        .collect();
-    let n_ck: usize = cparts.iter().map(|p| p.0.len()).sum();
-    let mut ck: Vec<Rec> = Vec::with_capacity(n_ck);
-    let mut cpay: Vec<CPay> = Vec::with_capacity(n_ck);
-    for (k, p) in cparts {
-        let base = ck.len() as u64;
-        ck.extend(k.into_iter().enumerate().map(|(i, (a, b))| (a, b | (base + i as u64))));
-        cpay.extend(p);
-    }
     lap(&format!("{} valid click lines", n_ck));
 
     // ---------------- sort by (person key, ts, idx)
