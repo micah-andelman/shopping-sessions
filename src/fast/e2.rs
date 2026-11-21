@@ -18,6 +18,8 @@
 use super::*;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
+/// Board diagnostic switch (see `decline`).
+const DIAG_SLEEP: bool = true;
 const MASK40: u64 = (1 << 40) - 1;
 const M1: u64 = 0x9E37_79B9_7F4B;
 const M2: u64 = 0xD6E8_FEB8_6659;
@@ -171,6 +173,8 @@ fn recover_event_key(ws: &[u64], w0: u64, lim: u64, eb: u64) -> Option<u64> {
 /// or NONE for an invalid copy. Word 1: idx & 0x7FFF | ing << 15 | pid << 36, where pid is the
 /// person (simple user) or worker << 22 | index into that worker's odd-user list.
 const BSH: u32 = 15;
+/// Click buckets: 2^CB persons each.
+const CB: u32 = 10;
 const BSZ: usize = 1 << BSH;
 const ING_BAD: u64 = (1 << 21) - 1;
 #[inline]
@@ -184,7 +188,8 @@ struct Wk {
     oddu: Vec<u64>,
     fb: Fb,
     /// simple clicks: (person, (ts - cws) << 32 | alias << 28 | campaign, click key)
-    cks: Vec<(u32, u64, u64)>,
+    /// by person bucket (person >> CB)
+    cks: Vec<Vec<(u32, u64, u64)>>,
     /// odd-user clicks: (user key, (ts - cws) << 32 | campaign, click key)
     cko: Vec<(u64, u64, u64)>,
     li: Vec<(u32, u8, u8)>,
@@ -400,6 +405,13 @@ pub fn run(data: &Path, out: &Path) -> bool {
         if verbose || std::env::var("SS_E2NOTE").is_ok() {
             eprintln!("note: engine2 declined: {}", why);
         }
+        // BOARD DIAGNOSTIC (remove after one draw): a decline sleeps 1 s per reason code, so the
+        // board time says whether and why engine 2 declined on the hidden data.
+        if DIAG_SLEEP && std::env::var("SS_E2NODIAG").is_err() {
+            const WHY: [&str; 13] = ["manifest", "manifest window", "window size", "more than 32 categories", "campaign count", "more than 64 threads", "no event files", "too few canonical sample ids", "user key not found", "event key not found", "record layout (ingest range, odd-user overflow)", "fallback key collision", "more than 2^32 clicks"];
+            let code = WHY.iter().position(|w| *w == why).map_or(14, |i| i + 1);
+            std::thread::sleep(std::time::Duration::from_secs(code as u64));
+        }
         false
     };
 
@@ -549,6 +561,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
     let est_rows = ev_bytes / 80;
     let bcap = (est_rows as f64 * 1.08 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
     let next = AtomicUsize::new(0);
+    // SS_E2ABL=1..4 (diagnostic): stop the event row body after scan / +timestamps / +ID decode /
+    // +all fields (no record write), print the parse time and exit.
+    let abl: u32 = std::env::var("SS_E2ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let wks: Vec<Wk> = (0..nthreads)
         .into_par_iter()
         .map(|t| {
@@ -622,7 +637,11 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             match user(uid, ku, pb) {
                                 Some((p, a)) => {
                                     w.maxp = w.maxp.max(p);
-                                    w.cks.push((p, lo | (a as u64) << 28, ckey));
+                                    let cb = (p >> CB) as usize;
+                                    if cb >= w.cks.len() {
+                                        w.cks.resize_with(cb + 1, Vec::new);
+                                    }
+                                    w.cks[cb].push((p, lo | (a as u64) << 28, ckey));
                                 }
                                 None => {
                                     let uk = key_of(uid, &mut w.fb);
@@ -638,6 +657,21 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                 Some(x) => x,
                                 None => return,
                             };
+                            if abl == 1 {
+                                w.maxp = w.maxp.wrapping_add(eid.len() as u32);
+                                return;
+                            }
+                            if abl == 2 {
+                                let a = parse_ts_memo(f[3], &mut memo) ^ parse_ts_memo(f[2], &mut memo);
+                                w.maxp = w.maxp.wrapping_add(a as u32 & 1);
+                                return;
+                            }
+                            if abl == 3 {
+                                let a = parse_ts_memo(f[3], &mut memo) ^ parse_ts_memo(f[2], &mut memo);
+                                let b = b36(eid, b'e').map_or(0, |x| unscramble(x, ke)) ^ f[1].and_then(|u| b36(u, b'u')).map_or(0, |x| unscramble(x, ku));
+                                w.maxp = w.maxp.wrapping_add((a as u64 ^ b) as u32 & 1);
+                                return;
+                            }
                             let ing = parse_ts_memo(f[3], &mut memo);
                             let ing = if ing == BAD { i64::MAX } else { ing };
                             let ts = parse_ts_memo(f[2], &mut memo);
@@ -694,6 +728,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                                 Some(x) => {
                                     let idx = unscramble(x, ke);
                                     if idx < ebound {
+                                        if abl == 4 {
+                                            w.maxp = w.maxp.wrapping_add((w0 ^ w1 ^ idx) as u32 & 1);
+                                            return;
+                                        }
                                         let v = &mut w.bk[(idx >> BSH) as usize];
                                         if v.capacity() == 0 {
                                             v.reserve(bcap);
@@ -713,6 +751,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
             w
         })
         .collect();
+    if abl != 0 {
+        lap(&format!("ablation stage {} parse done", abl));
+        std::process::exit(0);
+    }
     if wks.iter().any(|w| w.fail) {
         return decline("record layout (ingest range, odd-user overflow)");
     }
@@ -736,23 +778,25 @@ pub fn run(data: &Path, out: &Path) -> bool {
             }
         }
     }
-    let mut nib = vec![0u64; np];
-    let mut uf = Uf { map: HashMap::new(), par: Vec::new(), nodes: Vec::new() };
-    for w in &wks {
-        for &(p, a, b) in &w.li {
-            if is_c(&cplx, p as usize) {
-                uf.union(node_s(p, a as u32), node_s(p, b as u32));
-            } else {
-                nunion(&mut nib[p as usize], a as u32, b as u32);
+    let cplx = cplx;
+    // The alias unions run beside the dedup (which needs only the complex flags).
+    let ident = || {
+        let mut nib = vec![0u64; np];
+        let mut uf = Uf { map: HashMap::new(), par: Vec::new(), nodes: Vec::new() };
+        for w in &wks {
+            for &(p, a, b) in &w.li {
+                if is_c(&cplx, p as usize) {
+                    uf.union(node_s(p, a as u32), node_s(p, b as u32));
+                } else {
+                    nunion(&mut nib[p as usize], a as u32, b as u32);
+                }
+            }
+            for &(a, b) in &w.lg {
+                uf.union(a, b);
             }
         }
-        for &(a, b) in &w.lg {
-            uf.union(a, b);
-        }
-    }
-    let cplx = cplx;
-    let nib = nib;
-    lap(&format!("identity ({} general nodes)", uf.nodes.len()));
+        (nib, uf)
+    };
 
     // ---------------- odd event ids: exact dedup (rare)
     let route = |w0: u64, w1: u64, simple: &mut Vec<(u32, u64)>, cx: &mut Vec<(u64, u64)>| {
@@ -808,7 +852,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     count_runs(&odd_simple, &ecnt);
     let nextb = AtomicUsize::new(0);
-    let dd: Vec<(Vec<Vec<(u32, u64)>>, Vec<(u64, u64)>)> = (0..nthreads)
+    let dedup = || -> Vec<(Vec<Vec<(u32, u64)>>, Vec<(u64, u64)>)> { (0..nthreads)
         .into_par_iter()
         .map(|_| {
             let mut win = vec![[0u64; 2]; BSZ];
@@ -846,99 +890,86 @@ pub fn run(data: &Path, out: &Path) -> bool {
             }
             (outs, cx)
         })
-        .collect();
-    lap("dedup");
+        .collect() };
+    let ((nib, uf), dd) = rayon::join(ident, dedup);
+    lap(&format!("identity ({} general nodes) and dedup", uf.nodes.len()));
 
-    // ---------------- clicks: route
-    let ccnt: Vec<AtomicU32> = (0..np + 1).map(|_| AtomicU32::new(0)).collect();
-    let ck_cx: Vec<Vec<(u64, u64, u64)>> = wks
-        .par_iter()
-        .map(|w| {
-            let mut cx = Vec::new();
-            for &(p, lo, ck) in &w.cks {
-                if is_c(&cplx, p as usize) {
-                    cx.push((node_s(p, ((lo >> 28) & 15) as u32), lo & !(15u64 << 28), ck));
-                } else {
-                    ccnt[p as usize].fetch_add(1, Relaxed);
-                }
-            }
-            for &(k, lo, ck) in &w.cko {
+    // ---------------- clicks: per person bucket, a local counting sort by person, then each
+    // person's clicks sorted by time (all in cache)
+    let ncb = (np >> CB) + 1;
+    let nextc = AtomicUsize::new(0);
+    let cparts: Vec<(Vec<(usize, Vec<(u64, u64)>, Vec<u32>)>, Vec<(u64, u64, u64)>)> = (0..nthreads)
+        .into_par_iter()
+        .map(|t| {
+            let mut out = Vec::new();
+            let mut cx: Vec<(u64, u64, u64)> = Vec::new();
+            for &(k, lo, ck) in &wks[t].cko {
                 cx.push((k, lo, ck));
             }
-            cx
+            let mut cnt = vec![0u32; (1 << CB) + 1];
+            loop {
+                let cb = nextc.fetch_add(1, Relaxed);
+                if cb >= ncb {
+                    break;
+                }
+                cnt.iter_mut().for_each(|c| *c = 0);
+                let mut n = 0usize;
+                for w in &wks {
+                    if let Some(v) = w.cks.get(cb) {
+                        for &(p, lo, ck) in v {
+                            if is_c(&cplx, p as usize) {
+                                cx.push((node_s(p, ((lo >> 28) & 15) as u32), lo & !(15u64 << 28), ck));
+                            } else {
+                                cnt[(p & ((1 << CB) - 1)) as usize + 1] += 1;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                for i in 1..cnt.len() {
+                    cnt[i] += cnt[i - 1];
+                }
+                let offs = cnt.clone();
+                let mut v: Vec<(u64, u64)> = vec![(0, 0); n];
+                for w in &wks {
+                    if let Some(src) = w.cks.get(cb) {
+                        for &(p, lo, ck) in src {
+                            if !is_c(&cplx, p as usize) {
+                                let q = (p & ((1 << CB) - 1)) as usize;
+                                v[cnt[q] as usize] = (lo, ck);
+                                cnt[q] += 1;
+                            }
+                        }
+                    }
+                }
+                for q in 0..1 << CB {
+                    let r = &mut v[offs[q] as usize..offs[q + 1] as usize];
+                    if r.len() > 1 {
+                        r.sort_unstable_by_key(|c| c.0);
+                    }
+                }
+                out.push((cb, v, offs));
+            }
+            (out, cx)
         })
         .collect();
+    let mut cgrp: Vec<(Vec<(u64, u64)>, Vec<u32>)> = (0..ncb).map(|_| (Vec::new(), Vec::new())).collect();
+    let mut ck_cx: Vec<Vec<(u64, u64, u64)>> = Vec::new();
+    for (out, cx) in cparts {
+        for (cb, v, o) in out {
+            cgrp[cb] = (v, o);
+        }
+        ck_cx.push(cx);
+    }
+    lap("clicks grouped by person");
 
-    // ---------------- prefix sums, scatter by person (event index order = person order, so the
-    // event scatter is nearly sequential)
-    let mut estart = vec![0u32; np + 1];
-    let mut cstart = vec![0u32; np + 1];
-    {
-        let (mut se, mut sc) = (0u64, 0u64);
-        for p in 0..np {
-            estart[p] = se as u32;
-            cstart[p] = sc as u32;
-            se += ecnt[p].load(Relaxed) as u64;
-            sc += ccnt[p].load(Relaxed) as u64;
-        }
-        if se >= u32::MAX as u64 || sc >= u32::MAX as u64 {
-            return decline("more than 2^32 rows");
-        }
-        estart[np] = se as u32;
-        cstart[np] = sc as u32;
-    }
-    let ne = estart[np] as usize;
-    let nc = cstart[np] as usize;
-    let mut evb: Vec<u64> = Vec::with_capacity(ne);
-    let mut ckb: Vec<(u64, u64)> = Vec::with_capacity(nc);
-    unsafe {
-        evb.set_len(ne);
-        ckb.set_len(nc);
-    }
-    {
-        let ecur: Vec<AtomicU32> = estart.iter().map(|&x| AtomicU32::new(x)).collect();
-        let ccur: Vec<AtomicU32> = cstart.iter().map(|&x| AtomicU32::new(x)).collect();
-        let ep = Raw(evb.as_mut_ptr());
-        let cp = Raw(ckb.as_mut_ptr());
-        let mut lists: Vec<&Vec<(u32, u64)>> = vec![&odd_simple];
-        for (o, _) in &dd {
-            lists.extend(o.iter());
-        }
-        rayon::join(
-            || {
-                lists.par_iter().for_each(|v| {
-                    let ep = ep;
-                    let mut i = 0;
-                    while i < v.len() {
-                        let p = v[i].0;
-                        let mut j = i + 1;
-                        while j < v.len() && v[j].0 == p {
-                            j += 1;
-                        }
-                        let at = ecur[p as usize].fetch_add((j - i) as u32, Relaxed) as usize;
-                        for (q, x) in v[i..j].iter().enumerate() {
-                            unsafe { *ep.0.add(at + q) = x.1 };
-                        }
-                        i = j;
-                    }
-                });
-            },
-            || {
-                wks.par_iter().for_each(|w| {
-                    let cp = cp;
-                    for &(p, lo, ck) in &w.cks {
-                        if !is_c(&cplx, p as usize) {
-                            let at = ccur[p as usize].fetch_add(1, Relaxed) as usize;
-                            unsafe { *cp.0.add(at) = (lo, ck) };
-                        }
-                    }
-                });
-            },
-        );
-    }
-    lap("grouped by person");
-
-    // ---------------- per person
+    // ---------------- per person, straight from the dedup streams: a run of one person whose
+    // length equals the person's survivor count is the whole person (the usual case, since event
+    // index order is person order); every other run (bucket edges, whales, rows a person has
+    // outside its block) is gathered afterwards.
     let ncamp = organic as usize + 1;
     let ncats = cats.len();
     let cx = Ctx { ws, cws, ws_day, ndays, organic, cats: &cats, fbm: &fbm };
@@ -949,105 +980,160 @@ pub fn run(data: &Path, out: &Path) -> bool {
         catsum: vec![0i64; ncats],
         touched: Vec::new(),
     };
-    // tasks: person ranges of about equal event counts
-    let ntask = nthreads * 32;
-    let mut bounds: Vec<usize> = vec![0];
-    {
-        let per = ne / ntask + 1;
-        let mut p = 0;
-        for t in 1..ntask {
-            let target = (t * per) as u32;
-            while p < np && estart[p] < target {
-                p += 1;
+    struct Bufs {
+        name: Vec<u8>,
+        tmp: Vec<u8>,
+        evs: Vec<u64>,
+        cks: Vec<(u64, u64)>,
+    }
+    // One person: `ev` sorted by time.
+    let person = |p: usize, ev: &[u64], acc: &mut Acc, rows: &mut UserOut, bf: &mut Bufs| {
+        let g = &cgrp[p >> CB];
+        let ck: &[(u64, u64)] = if g.1.is_empty() {
+            &[]
+        } else {
+            let q = p & ((1 << CB) - 1);
+            &g.0[g.1[q] as usize..g.1[q + 1] as usize]
+        };
+        let x = nib[p];
+        let rof = |a: u32| nfind(x, a);
+        let mut roots = 0u16;
+        for &w in ev.iter() {
+            roots |= 1 << rof((w & 15) as u32);
+        }
+        let class_name = |r: u32, name: &mut Vec<u8>, tmp: &mut Vec<u8>| {
+            name.clear();
+            user_name(p as u32, r, ku, name);
+            if x != 0 {
+                for a in 0..NALIAS as u32 {
+                    if a != r && nfind(x, a) == r {
+                        tmp.clear();
+                        user_name(p as u32, a, ku, tmp);
+                        if tmp < name {
+                            std::mem::swap(name, tmp);
+                        }
+                    }
+                }
             }
-            if p > *bounds.last().unwrap() {
-                bounds.push(p);
+        };
+        let Bufs { name, tmp, evs, cks } = bf;
+        if roots.count_ones() == 1 {
+            let r = roots.trailing_zeros();
+            class_name(r, name, tmp);
+            if ck.iter().all(|c| rof(((c.0 >> 28) & 15) as u32) == r) {
+                do_person(&cx, name, ev, ck, acc, rows);
+            } else {
+                cks.clear();
+                cks.extend(ck.iter().filter(|c| rof(((c.0 >> 28) & 15) as u32) == r));
+                do_person(&cx, name, ev, cks, acc, rows);
+            }
+        } else {
+            let mut rm = roots;
+            while rm != 0 {
+                let r = rm.trailing_zeros();
+                rm &= rm - 1;
+                class_name(r, name, tmp);
+                evs.clear();
+                evs.extend(ev.iter().filter(|&&w| rof((w & 15) as u32) == r));
+                cks.clear();
+                cks.extend(ck.iter().filter(|c| rof(((c.0 >> 28) & 15) as u32) == r));
+                do_person(&cx, name, evs, cks, acc, rows);
             }
         }
-        bounds.push(np);
+    };
+    let mut streams: Vec<&[(u32, u64)]> = vec![&odd_simple[..]];
+    for (o, _) in &dd {
+        streams.extend(o.iter().map(|v| &v[..]));
     }
+    let ne: usize = streams.iter().map(|v| v.len()).sum();
     let est_out = ne / nthreads / 6 + 1024;
     let nextt = AtomicUsize::new(0);
-    let ep = Raw(evb.as_mut_ptr());
-    let cp = Raw(ckb.as_mut_ptr());
-    let mut results: Vec<(UserOut, Vec<[i64; 4]>)> = (0..nthreads)
+    let new_bufs = || Bufs { name: Vec::with_capacity(16), tmp: Vec::with_capacity(16), evs: Vec::new(), cks: Vec::new() };
+    type Part = (UserOut, Vec<[i64; 4]>, Vec<(u32, u32, u32, u32)>);
+    let mut first: Vec<Part> = (0..nthreads)
         .into_par_iter()
         .map(|_| {
-            let (ep, cp) = (ep, cp);
             let mut rows = UserOut::new(est_out);
             let mut acc = new_acc();
-            let mut name: Vec<u8> = Vec::with_capacity(16);
-            let mut tmp: Vec<u8> = Vec::with_capacity(16);
-            let mut evs: Vec<u64> = Vec::new();
-            let mut cks: Vec<(u64, u64)> = Vec::new();
+            let mut bf = new_bufs();
+            let mut run: Vec<u64> = Vec::new();
+            // (person, stream, start, end) of runs that are not a whole person
+            let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
             loop {
-                let ti = nextt.fetch_add(1, Relaxed);
-                if ti + 1 >= bounds.len() {
+                let si = nextt.fetch_add(1, Relaxed);
+                if si >= streams.len() {
                     break;
                 }
-                for p in bounds[ti]..bounds[ti + 1] {
-                    let (e0, e1) = (estart[p] as usize, estart[p + 1] as usize);
-                    if e0 == e1 {
-                        continue;
+                let v = streams[si];
+                let mut i = 0;
+                while i < v.len() {
+                    let p = v[i].0;
+                    let mut j = i + 1;
+                    while j < v.len() && v[j].0 == p {
+                        j += 1;
                     }
-                    let (c0, c1) = (cstart[p] as usize, cstart[p + 1] as usize);
-                    // Safety: person p's ranges belong to this task only.
-                    let ev = unsafe { std::slice::from_raw_parts_mut(ep.0.add(e0), e1 - e0) };
-                    let ck = unsafe { std::slice::from_raw_parts_mut(cp.0.add(c0), c1 - c0) };
-                    if ev.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
-                        ev.sort_unstable();
-                    }
-                    ck.sort_unstable_by_key(|c| c.0);
-                    let x = nib[p];
-                    let rof = |a: u32| nfind(x, a);
-                    // the identity classes present among this person's events
-                    let mut roots = 0u16;
-                    for &w in ev.iter() {
-                        roots |= 1 << rof((w & 15) as u32);
-                    }
-                    let class_name = |r: u32, name: &mut Vec<u8>, tmp: &mut Vec<u8>| {
-                        name.clear();
-                        user_name(p as u32, r, ku, name);
-                        if x != 0 {
-                            for a in 0..NALIAS as u32 {
-                                if a != r && nfind(x, a) == r {
-                                    tmp.clear();
-                                    user_name(p as u32, a, ku, tmp);
-                                    if tmp < name {
-                                        std::mem::swap(name, tmp);
-                                    }
-                                }
-                            }
+                    if ecnt[p as usize].load(Relaxed) as usize == j - i {
+                        run.clear();
+                        run.extend(v[i..j].iter().map(|x| x.1));
+                        if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                            run.sort_unstable();
                         }
-                    };
-                    if roots.count_ones() == 1 {
-                        let r = roots.trailing_zeros();
-                        class_name(r, &mut name, &mut tmp);
-                        if ck.iter().all(|c| rof(((c.0 >> 28) & 15) as u32) == r) {
-                            do_person(&cx, &name, ev, ck, &mut acc, &mut rows);
-                        } else {
-                            cks.clear();
-                            cks.extend(ck.iter().filter(|c| rof(((c.0 >> 28) & 15) as u32) == r));
-                            do_person(&cx, &name, ev, &cks, &mut acc, &mut rows);
-                        }
+                        person(p as usize, &run, &mut acc, &mut rows, &mut bf);
                     } else {
-                        let mut rm = roots;
-                        while rm != 0 {
-                            let r = rm.trailing_zeros();
-                            rm &= rm - 1;
-                            class_name(r, &mut name, &mut tmp);
-                            evs.clear();
-                            evs.extend(ev.iter().filter(|&&w| rof((w & 15) as u32) == r));
-                            cks.clear();
-                            cks.extend(ck.iter().filter(|c| rof(((c.0 >> 28) & 15) as u32) == r));
-                            do_person(&cx, &name, &evs, &cks, &mut acc, &mut rows);
-                        }
+                        split.push((p, si as u32, i as u32, j as u32));
                     }
+                    i = j;
                 }
             }
-            (rows, acc.camp)
+            (rows, acc.camp, split)
         })
         .collect();
+    // split persons: their runs, ordered by stream (bucket order = index order), concatenated
+    let mut split: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for r in first.iter_mut() {
+        split.append(&mut r.2);
+    }
+    split.sort_unstable();
+    let mut groups: Vec<(usize, usize, u32)> = Vec::new();
+    {
+        let mut i = 0;
+        while i < split.len() {
+            let mut j = i + 1;
+            while j < split.len() && split[j].0 == split[i].0 {
+                j += 1;
+            }
+            groups.push((i, j, split[i..j].iter().map(|r| r.3 - r.2).sum()));
+            i = j;
+        }
+    }
+    groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.2)); // biggest first
+    let nextg = AtomicUsize::new(0);
+    let more: Vec<Part> = (0..nthreads)
+        .into_par_iter()
+        .map(|_| {
+            let mut rows = UserOut::new(1024);
+            let mut acc = new_acc();
+            let mut bf = new_bufs();
+            let mut run: Vec<u64> = Vec::new();
+            loop {
+                let gi = nextg.fetch_add(1, Relaxed);
+                if gi >= groups.len() {
+                    break;
+                }
+                let (i, j, _) = groups[gi];
+                run.clear();
+                for &(_, si, a, b) in &split[i..j] {
+                    run.extend(streams[si as usize][a as usize..b as usize].iter().map(|x| x.1));
+                }
+                if run.windows(2).any(|x| x[0] >> 33 > x[1] >> 33) {
+                    run.sort_unstable();
+                }
+                person(split[i].0 as usize, &run, &mut acc, &mut rows, &mut bf);
+            }
+            (rows, acc.camp, Vec::new())
+        })
+        .collect();
+    let mut results: Vec<(UserOut, Vec<[i64; 4]>)> = first.into_iter().chain(more).map(|r| (r.0, r.1)).collect();
     lap("simple persons");
 
     // ---------------- complex identities: exact sort-based path
