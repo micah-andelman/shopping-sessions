@@ -856,7 +856,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let d: &'static [u8] = &lk_maps[mi][s..e];
             let mut v = Vec::new();
             let mut fb = Fb::new();
-            scan2::<2>(d, |f| {
+            scan::<2>(d, |f| {
                 if let [Some(a), Some(b)] = *f {
                     v.push((key_of(a, &mut fb), key_of(b, &mut fb)));
                 }
@@ -928,7 +928,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ev_maps[mi][s..e];
-                    scan2::<7>(d, |f| {
+                    scan::<7>(d, |f| {
                         let eid = match f[0] {
                             Some(x) => x,
                             None => return,
@@ -980,7 +980,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
                     let d: &'static [u8] = &ck_maps[mi][s..e];
-                    scan2::<4>(d, |f| {
+                    scan::<4>(d, |f| {
                         let (cid, uid) = match (f[0], f[1]) {
                             (Some(c), Some(u)) => (c, u),
                             _ => return,
