@@ -240,6 +240,164 @@ struct Ev {
     lo: u64,
 }
 
+/// One-pass record path (SS_ONEPASS=1): each event copy leaves the parse as a 16-byte dedup
+/// record in its event-id bucket, and (valid copies only) a 16-byte payload (user key, lo)
+/// written ONCE into the person partition of its user key. Dedup then only marks losing
+/// payloads dead in place (lo = NONE); a later pass moves just the rows whose user id maps to
+/// a different person. Dedup rule (identical to the old path): per event id the copy with the
+/// smallest ingest_ts wins; on equal ingest the first copy in (parse group, append) order wins
+/// (equal-ingest copies are identical per the rules); if the winner is invalid the event is
+/// dropped, so every valid loser is killed either way.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DRec {
+    ekey: u64,
+    /// ingest in whole seconds relative to ING_BASE; u32::MAX = unparseable ingest (never wins
+    /// over a parseable one, as i64::MAX did)
+    ing: u32,
+    /// partition << 24 | index into this group's payload partition, or u32::MAX if invalid
+    r: u32,
+}
+
+/// Parse output of one event group: the old 32-byte buckets, or the one-pass records.
+/// One-pass rows parsed BEFORE the link table is published go to their user key's partition
+/// (relocated later, only within `early[p]`); rows parsed after it go straight to their
+/// person's partition: ids the bit filter clears are their own person, the rest are resolved
+/// through a small prefetched batch.
+struct GOut<'a> {
+    onepass: bool,
+    bk: Vec<Wc>,
+    dd: Vec<Vec<DRec>>,
+    pay: Vec<Vec<(u64, u64)>>,
+    ing_base: i64,
+    fail: bool,
+    lcell: &'a std::sync::OnceLock<LinkTab>,
+    lt: Option<&'a LinkTab>,
+    /// per partition: rows [0, early[p]) were written before the link table was ready
+    early: Vec<u32>,
+    batch: Vec<(u64, u32, u64, u64)>,
+    atparse: bool,
+}
+impl<'a> GOut<'a> {
+    fn new(onepass: bool, cap: usize, ing_base: i64, lcell: &'a std::sync::OnceLock<LinkTab>, plain: bool) -> Self {
+        let atparse = std::env::var("SS_NOATPARSE").is_err();
+        if onepass {
+            GOut {
+                onepass,
+                bk: Vec::new(),
+                dd: (0..NB).map(|_| Vec::with_capacity(cap)).collect(),
+                pay: (0..256).map(|_| Vec::with_capacity(cap)).collect(),
+                ing_base,
+                fail: false,
+                lcell,
+                lt: None,
+                early: vec![u32::MAX; 256],
+                batch: Vec::with_capacity(16),
+                atparse,
+            }
+        } else {
+            GOut {
+                onepass,
+                bk: (0..NB).map(|_| Wc::with_capacity(cap, plain)).collect(),
+                dd: Vec::new(),
+                pay: Vec::new(),
+                ing_base,
+                fail: false,
+                lcell,
+                lt: None,
+                early: Vec::new(),
+                batch: Vec::new(),
+                atparse: false,
+            }
+        }
+    }
+    /// write one valid copy's payload (key = person key, or user key before the table is ready)
+    /// and its dedup record
+    #[inline(always)]
+    fn put(&mut self, ekey: u64, ing: u32, key: u64, lo: u64) {
+        let p = ppart_k(key);
+        let v = &mut self.pay[p];
+        if v.len() >= (1 << 24) - 1 {
+            self.fail = true; // index must stay below the all-ones "invalid" reference
+        }
+        v.push((key, lo));
+        let r = ((p as u32) << 24) | (v.len() as u32 - 1);
+        self.dd[bucket(ekey)].push(DRec { ekey, ing, r });
+    }
+    fn flush_batch(&mut self, t: &LinkTab) {
+        let b = std::mem::take(&mut self.batch);
+        for &(ekey, ing, ukey, lo) in &b {
+            let pk = t.get(ukey);
+            self.put(ekey, ing, pk, lo);
+        }
+        self.batch = b;
+        self.batch.clear();
+    }
+    /// end of the group: drain the batch and close the early segments
+    fn finish(&mut self) {
+        if !self.onepass {
+            for w in self.bk.iter_mut() {
+                w.finish();
+            }
+            return;
+        }
+        if let Some(t) = self.lt {
+            self.flush_batch(t);
+        }
+        for p in 0..256 {
+            if self.early[p] == u32::MAX {
+                self.early[p] = self.pay[p].len() as u32;
+            }
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, e: Ev) {
+        if !self.onepass {
+            self.bk[bucket(e.ekey)].push(e);
+            return;
+        }
+        let ing = if e.ing == i64::MAX {
+            u32::MAX
+        } else {
+            let d = e.ing - self.ing_base;
+            if e.ing % 1000 != 0 || d < 0 || d / 1000 >= u32::MAX as i64 {
+                self.fail = true;
+                0
+            } else {
+                (d / 1000) as u32
+            }
+        };
+        if e.lo == NONE {
+            self.dd[bucket(e.ekey)].push(DRec { ekey: e.ekey, ing, r: u32::MAX });
+            return;
+        }
+        if self.lt.is_none() && self.atparse {
+            if let Some(t) = self.lcell.get() {
+                self.lt = Some(t);
+                for p in 0..256 {
+                    self.early[p] = self.pay[p].len() as u32;
+                }
+            }
+        }
+        match self.lt {
+            Some(t) if t.maybe_linked(e.ukey) => {
+                t.prefetch(e.ukey);
+                self.batch.push((e.ekey, ing, e.ukey, e.lo));
+                if self.batch.len() == 16 {
+                    self.flush_batch(t);
+                }
+            }
+            _ => self.put(e.ekey, ing, e.ukey, e.lo),
+        }
+    }
+}
+
+/// Person partition of a key (256 partitions).
+#[inline(always)]
+fn ppart_k(k: u64) -> usize {
+    (mix(k ^ 0x5bd1_e995) >> 56) as usize
+}
+
 /// One 64-byte cache line of two event records (64-byte aligned).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
@@ -1060,25 +1218,32 @@ pub fn run(data: &Path, out: &Path) -> bool {
         })
             .collect();
     if verbose { eprintln!("  link {} {:.3}s", "parsed", t0.elapsed().as_secs_f64()); }
-    let link_job = move || -> Option<(LinkTab, Fb)> {
+    let lcell: std::sync::OnceLock<LinkTab> = std::sync::OnceLock::new();
+    let lref = &lcell;
+    let link_job = move || -> Option<Fb> {
         let fbm = merge_fb(parts.iter().map(|p| &p.1))?;
         let table = build_link_table(&parts, &fbm);
         if verbose { eprintln!("  link {} {:.3}s", "table", t0.elapsed().as_secs_f64()); }
         let fb: Fb = parts.into_iter().flat_map(|p| p.1).collect();
-        Some((table, fb))
+        // publish: one-pass parse workers resolve persons directly from here on
+        let _ = lref.set(table);
+        Some(fb)
     };
+    let onepass = std::env::var("SS_ONEPASS").is_ok();
+    // ingest seconds are stored relative to ~68 years before the window (u32 range)
+    let ing_base = ws - (1i64 << 31) * 1000;
 
     // ---------------- events: parse every copy, scatter by event_id bucket
     let wc_plain = std::env::var("SS_WCPLAIN").is_ok();
-    let ev_job = || -> Vec<(Vec<Wc>, Fb)> {
-        let r: Vec<(Vec<Wc>, Fb)> = ev_groups
+    let ev_job = || -> Vec<(GOut, Fb)> {
+        let r: Vec<(GOut, Fb)> = ev_groups
             .par_iter()
             .map(|grp| {
                 let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
                 // rows per bucket from the chunk bytes (event lines are >= ~68 bytes; a short
                 // estimate only means one regrowth of that bucket)
                 let cap = bytes / 68 / NB + 32;
-                let mut bk: Vec<Wc> = (0..NB).map(|_| Wc::with_capacity(cap, wc_plain)).collect();
+                let mut bk = GOut::new(onepass, cap, ing_base, &lcell, wc_plain);
                 let mut fb = Fb::new();
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
@@ -1112,12 +1277,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         } else {
                             (0, NONE)
                         };
-                        bk[bucket(ekey)].push(Ev { ekey, ukey, ing, lo });
+                        bk.push(Ev { ekey, ukey, ing, lo });
                     });
                 }
-                for w in bk.iter_mut() {
-                    w.finish();
-                }
+                bk.finish();
                 (bk, fb)
             })
             .collect();
@@ -1161,8 +1324,12 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     let ck_early = std::env::var("SS_CKLATE").is_err();
     let (links, (evp, ck_raw)) = rayon::join(link_job, || rayon::join(ev_job, || if ck_early { Some(ck_parse()) } else { None }));
-    let (ltab, lfb) = match links {
+    let lfb = match links {
         Some(x) => x,
+        None => return false,
+    };
+    let ltab: &LinkTab = match lcell.get() {
+        Some(t) => t,
         None => return false,
     };
     lap(&format!("links ({} ids) and events parsed", ltab.n));
@@ -1221,7 +1388,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     seen.fill(0);
                     dup.fill(0);
                     for g in &evp {
-                        for e in g.0[b].as_slice() {
+                        for e in g.0.bk[b].as_slice() {
                             let h = th(e.ekey) as usize & FMASK;
                             let (w, m) = (h >> 6, 1u64 << (h & 63));
                             dup[w] |= seen[w] & m;
@@ -1232,7 +1399,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     los.clear();
                     t.clear();
                     for g in &evp {
-                        for e in g.0[b].as_slice() {
+                        for e in g.0.bk[b].as_slice() {
                             let h = th(e.ekey);
                             let f = h as usize & FMASK;
                             if dup[f >> 6] & (1u64 << (f & 63)) == 0 {
@@ -1298,13 +1465,141 @@ pub fn run(data: &Path, out: &Path) -> bool {
         (cks, fb)
     };
 
-    let (eparts, (cparts, cfb)) = rayon::join(dedup_job, ck_job);
-    lap("dedup + clicks");
-    let fbm = match merge_fb(evp.iter().map(|g| &g.1).chain(std::iter::once(&lfb)).chain(std::iter::once(&cfb))) {
-        Some(m) => m,
-        None => return false,
+    let (eparts, cparts, fbm) = if !onepass {
+        let (eparts, (cparts, cfb)) = rayon::join(dedup_job, ck_job);
+        lap("dedup + clicks");
+        let fbm = match merge_fb(evp.iter().map(|g| &g.1).chain(std::iter::once(&lfb)).chain(std::iter::once(&cfb))) {
+            Some(m) => m,
+            None => return false,
+        };
+        drop(evp);
+        (eparts, cparts, fbm)
+    } else {
+        if evp.iter().any(|g| g.0.fail) {
+            eprintln!("note: one-pass record layout declined (ingest not whole seconds/out of range, or a partition over 2^24 rows)");
+            return false; // a record did not fit the packed layout: byte-exact legacy path
+        }
+        let mut evp = evp;
+        // (a) mark dedup losers dead in place. Workers own disjoint event-id buckets, so the
+        // payload slots they write (one per losing copy) never overlap.
+        let pptr: Vec<Vec<usize>> = evp.iter_mut().map(|g| g.0.pay.iter_mut().map(|v| v.as_mut_ptr() as usize).collect()).collect();
+        let mark_job = || {
+            let ng = (nthreads * 4).min(NB);
+            (0..ng).into_par_iter().for_each(|gi| {
+                const FBITS: usize = 1 << 20;
+                const FMASK: usize = FBITS - 1;
+                let mut seen = vec![0u64; FBITS / 64];
+                let mut dup = vec![0u64; FBITS / 64];
+                // candidates: (ekey, group, position in that group's bucket)
+                let mut cand: Vec<(u64, u32, u32)> = Vec::new();
+                // winner per event id: (ekey, ing, group, position)
+                let mut t: hashbrown::HashTable<(u64, u32, u32, u32)> = hashbrown::HashTable::new();
+                for b in (gi * NB / ng)..((gi + 1) * NB / ng) {
+                    seen.fill(0);
+                    dup.fill(0);
+                    for g in &evp {
+                        for d in &g.0.dd[b] {
+                            let h = th(d.ekey) as usize & FMASK;
+                            let (w, m) = (h >> 6, 1u64 << (h & 63));
+                            dup[w] |= seen[w] & m;
+                            seen[w] |= m;
+                        }
+                    }
+                    cand.clear();
+                    t.clear();
+                    for (gix, g) in evp.iter().enumerate() {
+                        for (pos, d) in g.0.dd[b].iter().enumerate() {
+                            let h = th(d.ekey);
+                            let f = h as usize & FMASK;
+                            if dup[f >> 6] & (1u64 << (f & 63)) == 0 {
+                                continue; // the only copy of its event: already in place
+                            }
+                            cand.push((d.ekey, gix as u32, pos as u32));
+                            match t.find_mut(h, |x| x.0 == d.ekey) {
+                                Some(x) => {
+                                    if d.ing < x.1 {
+                                        *x = (d.ekey, d.ing, gix as u32, pos as u32);
+                                    }
+                                }
+                                None => {
+                                    t.insert_unique(h, (d.ekey, d.ing, gix as u32, pos as u32), |x| th(x.0));
+                                }
+                            }
+                        }
+                    }
+                    for &(ek, gix, pos) in &cand {
+                        let w = t.find(th(ek), |x| x.0 == ek).unwrap();
+                        if w.2 == gix && w.3 == pos {
+                            continue;
+                        }
+                        let r = evp[gix as usize].0.dd[b][pos as usize].r;
+                        if r != u32::MAX {
+                            let (p, i) = ((r >> 24) as usize, (r & 0xFF_FFFF) as usize);
+                            unsafe { (*((pptr[gix as usize][p] as *mut (u64, u64)).add(i))).1 = NONE };
+                        }
+                    }
+                }
+            });
+        };
+        let ((), (cparts, cfb)) = rayon::join(mark_job, ck_job);
+        // (b) rows whose user id maps to a different person: rewrite the key in place, or move
+        // the row to its person's partition (the old slot is marked dead)
+        let compact = std::env::var("SS_NOCOMPACT").is_err();
+        let relocs: Vec<Vec<Vec<(u64, u64)>>> = evp
+            .par_iter_mut()
+            .map(|g| {
+                let mut out: Vec<Vec<(u64, u64)>> = (0..NP).map(|_| Vec::new()).collect();
+                let mut idx: Vec<u32> = Vec::new();
+                let mut ks: Vec<u64> = Vec::new();
+                let (pays, early) = (&mut g.0.pay, &g.0.early);
+                for (p, v) in pays.iter_mut().enumerate() {
+                    idx.clear();
+                    ks.clear();
+                    let lim = (early[p] as usize).min(v.len());
+                    for (i, row) in v[..lim].iter().enumerate() {
+                        if row.1 != NONE && ltab.maybe_linked(row.0) {
+                            idx.push(i as u32);
+                            ks.push(row.0);
+                        }
+                    }
+                    ltab.resolve_all(&mut ks);
+                    for (&i, &pk) in idx.iter().zip(ks.iter()) {
+                        let row = &mut v[i as usize];
+                        if pk == row.0 {
+                            continue;
+                        }
+                        let q = ppart(pk);
+                        if q == p {
+                            row.0 = pk;
+                        } else {
+                            out[q].push((pk, row.1));
+                            row.1 = NONE;
+                        }
+                    }
+                    // compact while the partition is still in cache: the person stage then never
+                    // walks dedup losers or moved-out slots (SS_NOCOMPACT=1 keeps them)
+                    if compact {
+                        v.retain(|r| r.1 != NONE);
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut eparts: Vec<Vec<Vec<(u64, u64)>>> = Vec::with_capacity(evp.len() + relocs.len());
+        let mut fbs: Vec<Fb> = Vec::with_capacity(evp.len());
+        for (g, fb) in evp {
+            eparts.push(g.pay);
+            fbs.push(fb);
+        }
+        eparts.extend(relocs);
+        let evp: Vec<((), Fb)> = fbs.into_iter().map(|f| ((), f)).collect();
+        let fbm = match merge_fb(evp.iter().map(|g| &g.1).chain(std::iter::once(&lfb)).chain(std::iter::once(&cfb))) {
+            Some(m) => m,
+            None => return false,
+        };
+        lap("dedup marked + relocated (one-pass)");
+        (eparts, cparts, fbm)
     };
-    drop(evp);
 
     let ncamp = organic as usize + 1;
     let ncats = cats.len();
@@ -1499,7 +1794,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 ck.clear();
                 if !use_radix {
                     for g in &eparts {
-                        ek.extend_from_slice(&g[p]);
+                        ek.extend(g[p].iter().filter(|r| r.1 != NONE));
                     }
                     for g in &cparts {
                         ck.extend_from_slice(&g[p]);
@@ -1532,6 +1827,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                 keys.clear();
                 for g in &eparts {
                     for &(pk, lo) in &g[p] {
+                        if lo == NONE {
+                            continue; // dedup loser or moved row (one-pass path)
+                        }
                         let h = mix(pk);
                         let id = match ids.find(h, |e| e.0 == pk) {
                             Some(e) => e.1,
