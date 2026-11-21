@@ -675,7 +675,10 @@ pub fn run(data: &Path, out: &Path) -> bool {
         jobs.push((2, c.0, c.1, c.2));
     }
     let est_rows = ev_bytes / 80;
-    let bcap = (est_rows as f64 * 1.08 / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
+    // headroom per (thread, bucket): threads take chunks dynamically, so their shares of a bucket
+    // vary; a bucket that outgrows its first reserve doubles (copy + fresh pages). SS_E2BCAPF tunes it.
+    let bcapf: f64 = std::env::var("SS_E2BCAPF").ok().and_then(|v| v.parse().ok()).unwrap_or(1.25);
+    let bcap = (est_rows as f64 * bcapf / nbk.min(est_rows / BSZ + 1) as f64 / nthreads as f64) as usize + 64;
     // clicks per (worker, person bucket), generously: ~25 events per person, lines >= 36 bytes
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     let ccap = ck_bytes / 36 / ((est_rows / 25 >> CB) + 1) / nthreads * 2 + 64;
@@ -886,6 +889,34 @@ pub fn run(data: &Path, out: &Path) -> bool {
     if abl != 0 {
         lap(&format!("ablation stage {} parse done", abl));
         std::process::exit(0);
+    }
+    if verbose {
+        // b7: memory map of the parse output (MB of capacity vs used; grown = buckets past the first reserve)
+        let mb = |b: usize| b as f64 / 1048576.0;
+        let (mut bc, mut bl, mut nb, mut grown) = (0usize, 0usize, 0usize, 0usize);
+        let first = bcap / 4 + 1;
+        let (mut ckc, mut ckl, mut other) = (0usize, 0usize, 0usize);
+        for w in &wks {
+            for c in &w.bk {
+                let c = unsafe { &*c.get() };
+                if c.lines.capacity() > 0 {
+                    nb += 1;
+                    bc += c.lines.capacity() * 64;
+                    bl += c.lines.len() * 64;
+                    if c.lines.capacity() > first {
+                        grown += 1;
+                    }
+                }
+            }
+            for v in &w.cks {
+                ckc += v.capacity() * std::mem::size_of::<(u32, u64, u64)>();
+                ckl += v.len() * std::mem::size_of::<(u32, u64, u64)>();
+            }
+            other += w.oddev.capacity() * 24 + w.oddu.capacity() * 8 + w.fb.capacity() * 24 + w.cko.capacity() * 24
+                + w.li.capacity() * 8 + w.lg.capacity() * 16 + w.cks.capacity() * 24 + w.bk.len() * 96;
+        }
+        eprintln!("e2 mem: bucket records cap {:.0} MB used {:.0} MB in {} (thread,bucket) vecs, {} grown past first reserve ({} lines = {:.2} MB); click tuples cap {:.0} used {:.0} MB; other {:.0} MB; nbk {} bcap {}",
+            mb(bc), mb(bl), nb, grown, first, mb(first * 64), mb(ckc), mb(ckl), mb(other), nbk, bcap);
     }
     let fail = wks.iter().fold(0u8, |a, w| a | w.fail);
     if fail & 1 != 0 {
