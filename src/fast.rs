@@ -240,6 +240,75 @@ struct Ev {
     lo: u64,
 }
 
+/// One 64-byte cache line of two event records (64-byte aligned).
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line2([Ev; 2]);
+
+/// Write-combining bucket for the parse scatter: records are staged in a one-line buffer that
+/// stays in L1/L2 (256 buckets x 64 B per thread) and full lines are written with non-temporal
+/// stores into 64-byte-aligned storage, so the 256-way scatter costs no read-for-ownership of
+/// the target lines and each bucket's output is sequential. SS_WCPLAIN=1 uses ordinary stores
+/// for the flush (same staging) for A/B. Readers use `as_slice` after `finish`.
+struct Wc {
+    lines: Vec<Line2>,
+    n: usize,
+    buf: Line2,
+    plain: bool,
+}
+impl Wc {
+    fn with_capacity(rows: usize, plain: bool) -> Self {
+        let z = Ev { ekey: 0, ukey: 0, ing: 0, lo: 0 };
+        Wc { lines: Vec::with_capacity(rows / 2 + 1), n: 0, buf: Line2([z, z]), plain }
+    }
+    #[inline(always)]
+    fn push(&mut self, e: Ev) {
+        self.buf.0[self.n & 1] = e;
+        self.n += 1;
+        if self.n & 1 == 0 {
+            self.flush_line();
+        }
+    }
+    #[inline(always)]
+    fn flush_line(&mut self) {
+        if self.lines.len() == self.lines.capacity() {
+            self.lines.reserve(self.lines.capacity().max(16));
+        }
+        unsafe {
+            let dst = self.lines.as_mut_ptr().add(self.lines.len());
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                if !self.plain {
+                    use std::arch::x86_64::*;
+                    let s = &self.buf as *const Line2 as *const __m256i;
+                    let d = dst as *mut __m256i;
+                    _mm256_stream_si256(d, _mm256_load_si256(s));
+                    _mm256_stream_si256(d.add(1), _mm256_load_si256(s.add(1)));
+                } else {
+                    std::ptr::write(dst, self.buf);
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            std::ptr::write(dst, self.buf);
+            self.lines.set_len(self.lines.len() + 1);
+        }
+    }
+    /// write the partial last line with an ordinary store and order the streamed stores
+    fn finish(&mut self) {
+        if self.n & 1 == 1 {
+            self.lines.push(self.buf);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
+    }
+    #[inline]
+    fn as_slice(&self) -> &[Ev] {
+        unsafe { std::slice::from_raw_parts(self.lines.as_ptr() as *const Ev, self.n) }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Ck {
     pkey: u64,
@@ -953,13 +1022,16 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
 
     // ---------------- events: parse every copy, scatter by event_id bucket
-    let ev_job = || -> Vec<(Vec<Vec<Ev>>, Fb)> {
-        let r: Vec<(Vec<Vec<Ev>>, Fb)> = ev_groups
+    let wc_plain = std::env::var("SS_WCPLAIN").is_ok();
+    let ev_job = || -> Vec<(Vec<Wc>, Fb)> {
+        let r: Vec<(Vec<Wc>, Fb)> = ev_groups
             .par_iter()
             .map(|grp| {
                 let bytes: usize = grp.iter().map(|c| c.2 - c.1).sum();
-                let cap = bytes / 64 / NB + 64;
-                let mut bk: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+                // rows per bucket from the chunk bytes (event lines are >= ~68 bytes; a short
+                // estimate only means one regrowth of that bucket)
+                let cap = bytes / 68 / NB + 32;
+                let mut bk: Vec<Wc> = (0..NB).map(|_| Wc::with_capacity(cap, wc_plain)).collect();
                 let mut fb = Fb::new();
                 let mut memo = TsMemo::default();
                 for &(mi, s, e) in grp.iter() {
@@ -995,6 +1067,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                         };
                         bk[bucket(ekey)].push(Ev { ekey, ukey, ing, lo });
                     });
+                }
+                for w in bk.iter_mut() {
+                    w.finish();
                 }
                 (bk, fb)
             })
@@ -1099,7 +1174,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     seen.fill(0);
                     dup.fill(0);
                     for g in &evp {
-                        for e in &g.0[b] {
+                        for e in g.0[b].as_slice() {
                             let h = th(e.ekey) as usize & FMASK;
                             let (w, m) = (h >> 6, 1u64 << (h & 63));
                             dup[w] |= seen[w] & m;
@@ -1110,7 +1185,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
                     los.clear();
                     t.clear();
                     for g in &evp {
-                        for e in &g.0[b] {
+                        for e in g.0[b].as_slice() {
                             let h = th(e.ekey);
                             let f = h as usize & FMASK;
                             if dup[f >> 6] & (1u64 << (f & 63)) == 0 {
