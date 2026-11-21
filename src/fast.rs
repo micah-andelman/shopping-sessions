@@ -541,7 +541,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
                             if p < 0 { ok = false } else { price = p as u64 }
                         }
                         let (ukey, lo) = if ok {
-                            let cat = prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown);
+                            // Category only matters for purchases (price > 0); skip the product
+                            // hash lookup for views and carts (~97% of valid rows).
+                            let cat = if typ == 2 { prod.get(f[5].unwrap()).map(|c| c as u64).unwrap_or(unknown) } else { 0 };
                             (key_of(f[1].unwrap(), &mut fb), ((ts - ws) as u64) << 33 | price << 9 | cat)
                         } else {
                             (0, NONE)
