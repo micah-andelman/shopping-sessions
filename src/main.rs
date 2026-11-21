@@ -587,6 +587,7 @@ unsafe impl<T> Send for Raw<T> {}
 unsafe impl<T> Sync for Raw<T> {}
 
 mod fast;
+mod genid;
 mod pq;
 mod scan;
 
@@ -598,6 +599,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(if args.len() > 2 { args[1].clone() } else { env("DATA_DIR", "/data") });
     let out = PathBuf::from(if args.len() > 2 { args[2].clone() } else { env("OUTPUT_DIR", "/output") });
+    // SS_GENID_CHECK=1 (diagnostic, engine2 S0): recover the generator keys and check every ID.
+    if std::env::var("SS_GENID_CHECK").is_ok() {
+        genid::check(&data, std::env::var("SS_GENID_SEED").ok().and_then(|v| v.parse().ok()));
+        std::process::exit(0);
+    }
     // SS_LEGACY forces the v4 path (for differential testing).
     if std::env::var("SS_LEGACY").is_err() && fast::run(&data, &out) {
         std::process::exit(0);
