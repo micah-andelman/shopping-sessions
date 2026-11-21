@@ -704,6 +704,12 @@ fn probe_facts() {
 
 pub fn run(data: &Path, out: &Path) -> bool {
     if std::env::var("SS_PROBE").is_ok() {
+        // time from this process's exec to here: /proc/uptime minus our start time (clock ticks)
+        let up: f64 = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next().and_then(|x| x.parse().ok())).unwrap_or(0.0);
+        let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+        let start: f64 = f.get(19).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        eprintln!("PROBE exec-to-main {:.1} ms (pid {})", (up - start) * 1e3, std::process::id());
         probe_facts();
     }
     let t0 = std::time::Instant::now();
@@ -733,7 +739,7 @@ pub fn run(data: &Path, out: &Path) -> bool {
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
-            eprintln!("e2 {:>8.3}s  {}  [usr {:.3} sys {:.3}]", t0.elapsed().as_secs_f64(), what, tv(ru.ru_utime), tv(ru.ru_stime))
+            eprintln!("e2 {:>8.3}s  {}  [usr {:.3} sys {:.3} minflt {} majflt {}]", t0.elapsed().as_secs_f64(), what, tv(ru.ru_utime), tv(ru.ru_stime), ru.ru_minflt, ru.ru_majflt)
         }
     };
     let decline = |why: &str| {
