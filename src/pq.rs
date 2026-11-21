@@ -23,6 +23,10 @@ pub struct Col {
 }
 
 impl Col {
+    /// (address, capacity in bytes) of the value buffer, for releasing its pages before exit.
+    pub fn buf_span(&self) -> (usize, usize) {
+        (self.buf.as_ptr() as usize, self.buf.capacity())
+    }
     pub fn new(name: &'static str, kind: Kind, rows: usize) -> Col {
         let per = match kind {
             Kind::I32 | Kind::Date => 4,

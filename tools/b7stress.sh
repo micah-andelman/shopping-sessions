@@ -4,7 +4,7 @@
 set -u
 P="$(cygpath -w "$PWD")"; R="$P\target\release"
 O=/d/buildathon-data/b7sweep/st; W='D:\buildathon-data\b7sweep\st'; mkdir -p $O
-VARS="SS_E2ACAP=1 SS_E2ACAP=40 SS_E2ACAP=200,NCPU=3"
+VARS="SS_E2BADKEY=1 NCPU=1 NCPU=3 NCPU=24,SS_CHUNK=4096 SS_REVFILES=1,SS_CHUNK=65536 SS_E2ACAP=40"
 MSYS_NO_PATHCONV=1 docker run --rm --cpuset-cpus=16-23 -v "$P\\dev:/in/dev:ro" -v "D:\buildathon-data\diff:/df:ro" -v "$R:/b:ro" -v "$W:/o" debian:bookworm-slim sh -c "
   rm -rf /o/*
   for v in $VARS; do e=\$(echo \$v | tr , ' ')

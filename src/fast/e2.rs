@@ -818,8 +818,9 @@ pub fn run(data: &Path, out: &Path) -> bool {
     // in it until exit). If the mapping fails, every Wc4 uses its overflow Vec instead.
     // SS_E2ACAP (test knob): region lines per (bucket, worker), to force the overflow paths
     let acap = std::env::var("SS_E2ACAP").ok().and_then(|v| v.parse().ok()).unwrap_or(bcap / 4 + 1);
+    let arena_bytes = nbk * nthreads * acap * std::mem::size_of::<Line4>();
     let arena: usize = {
-        let bytes = nbk * nthreads * acap * std::mem::size_of::<Line4>();
+        let bytes = arena_bytes;
         let p = unsafe {
             libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
@@ -1587,6 +1588,49 @@ pub fn run(data: &Path, out: &Path) -> bool {
     };
     rayon::join(write_users, write_camps);
     lap("written");
+
+    // ---------------- release the big regions in parallel: the kernel's exit teardown is serial,
+    // MADV_DONTNEED on disjoint slices is not. Only buffers that are dead from here on (the outputs
+    // are written); never stacks or the input maps. SS_E2NOREL=1 turns it off (A/B).
+    if std::env::var("SS_E2NOREL").is_err() {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        if arena != 0 {
+            spans.push((arena, arena_bytes));
+        }
+        for w in &wks {
+            for v in &w.cks {
+                spans.push((v.as_ptr() as usize, v.capacity() * std::mem::size_of::<(u64, u64)>()));
+            }
+        }
+        for (v, o) in &cgrp {
+            spans.push((v.as_ptr() as usize, v.capacity() * std::mem::size_of::<(u64, u64)>()));
+            spans.push((o.as_ptr() as usize, o.capacity() * 4));
+        }
+        for (rows, _) in &results {
+            for c in &rows.c {
+                spans.push(c.buf_span());
+            }
+        }
+        // whole pages inside each span, cut at absolute 2 MB boundaries (no huge page is split)
+        const SL: usize = 2 << 20;
+        let mut sl: Vec<(usize, usize)> = Vec::new();
+        for (p, n) in spans {
+            if n < 1 << 18 {
+                continue;
+            }
+            let (a, e) = ((p + 4095) & !4095, (p + n) & !4095);
+            let mut s = a;
+            while s < e {
+                let t = ((s & !(SL - 1)) + SL).min(e);
+                sl.push((s, t - s));
+                s = t;
+            }
+        }
+        sl.par_iter().for_each(|&(p, n)| unsafe {
+            libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+        });
+        lap(&format!("released ({} slices)", sl.len()));
+    }
     std::process::exit(0)
 }
 
